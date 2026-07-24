@@ -1,0 +1,24 @@
+name: Pixaeron deploy service script
+description: Exposes the versioned Pixaeron VPS deployment script to a workflow job.
+
+outputs:
+  script_path:
+    description: Absolute path to deploy-service.sh on the runner.
+    value: ${{ steps.locate.outputs.script_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Locate deployment script
+      id: locate
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        script_path="$GITHUB_ACTION_PATH/deploy-service.sh"
+        [[ -f "$script_path" ]] || {
+          echo "Deployment script not found: $script_path" >&2
+          exit 1
+        }
+
+        echo "script_path=$script_path" >> "$GITHUB_OUTPUT"
