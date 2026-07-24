@@ -253,7 +253,6 @@ jobs:
     concurrency:
       group: pixaeron-production
       cancel-in-progress: false
-      queue: max
 
     permissions:
       actions: read
