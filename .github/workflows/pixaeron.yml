@@ -53,11 +53,17 @@ jobs:
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/auth
       PORT: 3000
-      JWT_SECRET: ci-only-secret
-      IP_HASH_SECRET: ci-only-ip-hash-secret
+      JWT_SECRET: ci-only-jwt-secret-at-least-32-characters
+      IP_HASH_SECRET: ci-only-ip-hash-secret-at-least-32-characters
       JWT_EXPIRATION_MS: 900000
+      SESSION_REFRESH_EXPIRATION_MS: 86400000
+      REFRESH_EXPIRATION_MS: 604800000
+      REFRESH_TOKEN_HASH_ROUNDS: 12
       CORS_ORIGINS: http://localhost:3000
       REDIS_URL: redis://127.0.0.1:6379
+      GOOGLE_CLIENT_ID: 1234567890-ci.apps.googleusercontent.com
+      CAPTCHA_ENABLED: false
+      EMAIL_DELIVERY_ENABLED: false
 
     outputs:
       deploy_matrix: ${{ steps.deploy_matrix.outputs.matrix }}
