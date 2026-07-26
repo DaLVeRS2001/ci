@@ -8,8 +8,9 @@ application source, runtime secrets, Compose models, or deployment manifests.
 
 ```text
 .github/workflows/
-  pixaeron.yml  reusable Pixaeron verify/deploy workflow
-  validate.yml  validation for this central repository
+  pixaeron.yml           reusable Pixaeron backend verify/deploy workflow
+  pixaeron-frontend.yml  reusable Pixaeron frontend verify/deploy workflow
+  validate.yml           validation for this central repository
 
 actions/pixaeron/deploy-service/
   action.yml         exposes the versioned script path to a workflow job
@@ -120,6 +121,42 @@ selected service and dependencies, runs an optional backward-compatible
 migration, waits for health, restores the prior image/configuration on failure,
 and prunes old labeled service images after success.
 
+## Pixaeron Frontend Workflow
+
+The frontend uses Cloudflare Workers Static Assets rather than a frontend Docker
+image. Cloudflare recommends Workers Static Assets for new static sites and SPAs;
+Pages remains supported but is no longer the preferred starting point. The reusable
+workflow is deliberately Pixaeron-specific and does not introduce a speculative
+shared frontend action.
+
+The caller supplies only public build-time values and the Cloudflare account ID:
+
+```text
+GRAPHQL_API_URL
+GOOGLE_CLIENT_ID
+TURNSTILE_SITE_KEY
+CLOUDFLARE_ACCOUNT_ID
+```
+
+Only `CLOUDFLARE_API_TOKEN` is secret. Store it exclusively as the frontend
+repository's protected `production` environment secret and scope it to Edit
+Cloudflare Workers for the Pixaeron Cloudflare account. It does not need DNS,
+Tunnel, billing, or account administration permissions.
+
+Pull requests run `npm ci` and `npm run check` without receiving the Cloudflare
+token. A trusted push to `main`, or a manual run on `main`, repeats the complete
+verification under the caller repository's protected `production` environment.
+The token is exposed only to the final `wrangler deploy` step, and the resulting
+Cloudflare version message records the caller repository and Git commit SHA.
+Production deployments use a non-cancelling concurrency group. Preview
+deployment is intentionally not enabled until Pixaeron has a non-production
+backend, stable preview Google OAuth origin, and preview Turnstile hostname.
+
+The frontend caller must reference this workflow by a full commit SHA. The
+central workflow requires Node.js 24 and expects the caller repository to own
+`wrangler.jsonc`, the exact Wrangler dependency, the Webpack build, and all
+application tests.
+
 ## Permissions And Secrets
 
 The caller job provides the maximum permission ceiling because a called
@@ -137,9 +174,11 @@ Application runtime secrets do not belong in this public repository.
 the Pixaeron repository/environment. Runtime application values remain in AWS
 Systems Manager Parameter Store.
 
-The reusable deploy job declares `environment: production`. Environment
+The reusable deploy jobs declare `environment: production`. Environment
 protection, variables such as `AWS_DEPLOY_ROLE_ARN`/`AWS_REGION`, and
-environment secrets are resolved in the Pixaeron caller context.
+environment secrets are resolved in the Pixaeron caller context. The frontend
+Cloudflare token is not part of the `workflow_call` contract: the called deploy
+job reads the caller repository's `production` environment secret directly.
 
 ## SHA Versioning
 
@@ -204,6 +243,9 @@ demonstrably identical mechanics.
 ## Official GitHub References
 
 - [Reusable workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows)
+- [Cloudflare Workers Static Assets](https://developers.cloudflare.com/workers/static-assets/)
+- [Cloudflare SPA routing](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/)
+- [Cloudflare external CI/CD](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/)
 - [Reusable workflow behavior and permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations)
 - [OIDC token permissions](https://docs.github.com/en/actions/reference/security/oidc)
 - [GitHub Packages permissions](https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions)

@@ -1,0 +1,125 @@
+name: Pixaeron frontend CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      deploy:
+        description: Deploy the verified build to Cloudflare production
+        required: true
+        type: boolean
+      graphql_api_url:
+        description: Browser-facing production GraphQL endpoint
+        required: true
+        type: string
+      google_client_id:
+        description: Public Google Identity Services web client ID
+        required: true
+        type: string
+      turnstile_site_key:
+        description: Public Cloudflare Turnstile site key
+        required: true
+        type: string
+      cloudflare_account_id:
+        description: Cloudflare account that owns pixaeron-web
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  verify:
+    name: Verify frontend
+    if: ${{ !inputs.deploy }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+
+    env:
+      GRAPHQL_API_URL: ${{ inputs.graphql_api_url }}
+      GOOGLE_CLIENT_ID: ${{ inputs.google_client_id }}
+      TURNSTILE_SITE_KEY: ${{ inputs.turnstile_site_key }}
+
+    steps:
+      - name: Validate public build configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GRAPHQL_API_URL" == 'https://api.pixaeron.com/graphql' ]] || { echo 'GRAPHQL_API_URL must be https://api.pixaeron.com/graphql.' >&2; exit 1; }
+          [[ "$GOOGLE_CLIENT_ID" =~ ^[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$ ]] || { echo 'GOOGLE_CLIENT_ID has an invalid web client ID format.' >&2; exit 1; }
+          [[ "$TURNSTILE_SITE_KEY" != *[[:space:]]* && ${#TURNSTILE_SITE_KEY} -ge 20 ]] || { echo 'TURNSTILE_SITE_KEY has an invalid format.' >&2; exit 1; }
+
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify frontend
+        run: npm run check
+
+      - name: Validate Cloudflare deployment configuration
+        run: npm run cloudflare:deploy:dry-run
+
+  deploy:
+    name: Deploy frontend
+    if: ${{ inputs.deploy && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: pixaeron-frontend-production
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+
+    env:
+      GRAPHQL_API_URL: ${{ inputs.graphql_api_url }}
+      GOOGLE_CLIENT_ID: ${{ inputs.google_client_id }}
+      TURNSTILE_SITE_KEY: ${{ inputs.turnstile_site_key }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+
+    steps:
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GRAPHQL_API_URL" == 'https://api.pixaeron.com/graphql' ]] || { echo 'GRAPHQL_API_URL must be https://api.pixaeron.com/graphql.' >&2; exit 1; }
+          [[ "$GOOGLE_CLIENT_ID" =~ ^[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$ ]] || { echo 'GOOGLE_CLIENT_ID has an invalid web client ID format.' >&2; exit 1; }
+          [[ "$TURNSTILE_SITE_KEY" != *[[:space:]]* && ${#TURNSTILE_SITE_KEY} -ge 20 ]] || { echo 'TURNSTILE_SITE_KEY has an invalid format.' >&2; exit 1; }
+          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[0-9a-fA-F]{32}$ ]] || { echo 'CLOUDFLARE_ACCOUNT_ID must be a 32-character hexadecimal account ID.' >&2; exit 1; }
+
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify production build
+        run: npm run check
+
+      - name: Validate Cloudflare deployment configuration
+        run: npm run cloudflare:deploy:dry-run
+
+      - name: Deploy verified static assets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$CLOUDFLARE_API_TOKEN" ]] || { echo 'CLOUDFLARE_API_TOKEN is required in the protected production environment.' >&2; exit 1; }
+          npm run cloudflare:deploy -- --message "GitHub ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
