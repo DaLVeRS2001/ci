@@ -9,7 +9,7 @@ application source, runtime secrets, Compose models, or deployment manifests.
 ```text
 .github/workflows/
   pixaeron.yml           reusable Pixaeron backend verify/deploy workflow
-  pixaeron-frontend.yml  reusable Pixaeron frontend verify/deploy workflow
+  pixaeron-frontend.yml  reusable Pixaeron frontend verification workflow
   validate.yml           validation for this central repository
 
 actions/pixaeron/deploy-service/
@@ -129,28 +129,32 @@ Pages remains supported but is no longer the preferred starting point. The reusa
 workflow is deliberately Pixaeron-specific and does not introduce a speculative
 shared frontend action.
 
-The caller supplies only public build-time values and the Cloudflare account ID:
+The caller supplies only public build-time values:
 
 ```text
 GRAPHQL_API_URL
 GOOGLE_CLIENT_ID
 TURNSTILE_SITE_KEY
-CLOUDFLARE_ACCOUNT_ID
 ```
 
-Only `CLOUDFLARE_API_TOKEN` is secret. Store it exclusively as the frontend
-repository's protected `production` environment secret and scope it to Edit
-Cloudflare Workers for the Pixaeron Cloudflare account. It does not need DNS,
-Tunnel, billing, or account administration permissions.
+Pull requests and trusted `main` runs execute `npm ci`, `npm run check`, and a
+Wrangler dry run without deployment credentials. A trusted `main` run also
+uploads the exact verified `build/` directory as a one-day workflow artifact.
+The frontend repository then owns a small local deploy job. That job downloads
+the verified artifact and targets its protected `production` environment, where
+`CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` are resolved.
 
-Pull requests run `npm ci` and `npm run check` without receiving the Cloudflare
-token. A trusted push to `main`, or a manual run on `main`, repeats the complete
-verification under the caller repository's protected `production` environment.
-The token is exposed only to the final `wrangler deploy` step, and the resulting
-Cloudflare version message records the caller repository and Git commit SHA.
-Production deployments use a non-cancelling concurrency group. Preview
-deployment is intentionally not enabled until Pixaeron has a non-production
-backend, stable preview Google OAuth origin, and preview Turnstile hostname.
+This boundary is required by GitHub Actions: environment secrets cannot be
+passed through `workflow_call`, and a caller job that uses a reusable workflow
+cannot itself declare `environment`. Keeping the deployment job in the
+application repository preserves environment approvals and avoids placing
+project credentials in this central CI repository.
+
+The Cloudflare token is exposed only to the local frontend job's final
+`wrangler deploy` step. Production deployments use a non-cancelling concurrency
+group. Preview deployment is intentionally not enabled until Pixaeron has a
+non-production backend, stable preview Google OAuth origin, and preview
+Turnstile hostname.
 
 The frontend caller must reference this workflow by a full commit SHA. The
 central workflow requires Node.js 24 and expects the caller repository to own
@@ -174,11 +178,12 @@ Application runtime secrets do not belong in this public repository.
 the Pixaeron repository/environment. Runtime application values remain in AWS
 Systems Manager Parameter Store.
 
-The reusable deploy jobs declare `environment: production`. Environment
-protection, variables such as `AWS_DEPLOY_ROLE_ARN`/`AWS_REGION`, and
-environment secrets are resolved in the Pixaeron caller context. The frontend
-Cloudflare token is not part of the `workflow_call` contract: the called deploy
-job reads the caller repository's `production` environment secret directly.
+The reusable backend deploy job declares `environment: production`; its AWS and
+VPS deployment configuration follows the backend workflow contract. Frontend
+deployment is intentionally different: its reusable workflow is secretless,
+while the frontend repository's local deploy job declares
+`environment: production` and reads that repository's Cloudflare environment
+secret directly.
 
 ## SHA Versioning
 
