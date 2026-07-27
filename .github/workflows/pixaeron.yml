@@ -8,7 +8,13 @@ on:
         required: false
         default: all
         type: string
+      apollo_graph_ref:
+        description: GraphOS production graph in graph-id@production form
+        required: true
+        type: string
     secrets:
+      APOLLO_KEY:
+        required: false
       VPS_HOST:
         required: false
       VPS_USER:
@@ -69,6 +75,7 @@ jobs:
     outputs:
       deploy_matrix: ${{ steps.deploy_matrix.outputs.matrix }}
       has_deployments: ${{ steps.deploy_matrix.outputs.has_deployments }}
+      auth_schema_check_required: ${{ steps.deploy_matrix.outputs.auth_schema_check_required }}
 
     steps:
       - name: Checkout repository
@@ -221,6 +228,10 @@ jobs:
             exit 1
           }
 
+          if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+            affected="$(npx nx show projects --affected --json)"
+          fi
+
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
             selected='[]'
           elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
@@ -232,7 +243,6 @@ jobs:
                 .github/deploy-services.json)"
             fi
           else
-            affected="$(npx nx show projects --affected --json)"
             selected="$(jq -c --argjson affected "$affected" \
               '[.[] | select(.project as $project | ($affected | index($project)))]' \
               .github/deploy-services.json)"
@@ -247,11 +257,70 @@ jobs:
             echo "has_deployments=false" >> "$GITHUB_OUTPUT"
           fi
 
-  deploy:
-    name: Deploy ${{ matrix.project }}
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            auth_schema_check_required="$(jq -r 'any(.[]; .project == "auth")' <<< "$selected")"
+          else
+            auth_schema_check_required="$(jq -r 'index("auth") != null' <<< "$affected")"
+          fi
+          echo "auth_schema_check_required=$auth_schema_check_required" >> "$GITHUB_OUTPUT"
+
+  graphos-check:
+    name: Check Auth schema in GraphOS
     needs: verify
     if: >-
       needs.verify.result == 'success' &&
+      needs.verify.outputs.auth_schema_check_required == 'true' &&
+      (
+        github.event_name != 'pull_request' ||
+        (
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          github.actor != 'dependabot[bot]'
+        )
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Require GraphOS configuration
+        env:
+          APOLLO_GRAPH_REF: ${{ inputs.apollo_graph_ref }}
+          APOLLO_KEY: ${{ secrets.APOLLO_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$APOLLO_GRAPH_REF" =~ ^[^@[:space:]]+@production$ ]] || { echo 'APOLLO_GRAPH_REF must use graph-id@production format.' >&2; exit 1; }
+          [[ -n "$APOLLO_KEY" ]] || { echo 'APOLLO_KEY is required for trusted GraphOS checks.' >&2; exit 1; }
+
+      - name: Check Auth subgraph schema
+        uses: apollographql-gh-actions/rover-subgraph-check@6b0bfef2687fc4004bb89c5228050d5151bd6ec3 # Rover 0.41.0
+        env:
+          APOLLO_VCS_BRANCH: ${{ github.head_ref || github.ref_name }}
+          APOLLO_VCS_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        with:
+          apollo-key: ${{ secrets.APOLLO_KEY }}
+          graph-ref: ${{ inputs.apollo_graph_ref }}
+          name: auth
+          schema: apps/auth/schema.graphql
+
+  deploy:
+    name: Deploy ${{ matrix.project }}
+    needs:
+      - verify
+      - graphos-check
+    if: >-
+      always() &&
+      needs.verify.result == 'success' &&
+      (
+        needs.graphos-check.result == 'success' ||
+        (
+          needs.graphos-check.result == 'skipped' &&
+          needs.verify.outputs.auth_schema_check_required == 'false'
+        )
+      ) &&
       needs.verify.outputs.has_deployments == 'true' &&
       github.event_name != 'pull_request' &&
       github.ref == 'refs/heads/main'
@@ -436,3 +505,17 @@ jobs:
             "$MIGRATION_COMMAND"
 
           ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" "$remote_command"
+
+      - name: Publish Auth schema to GraphOS
+        if: matrix.project == 'auth'
+        uses: apollographql-gh-actions/rover-subgraph-publish@c9891df6980a56ca2ccd0374e83e664453222ee6 # Rover 0.41.0
+        env:
+          APOLLO_VCS_BRANCH: ${{ github.ref_name }}
+          APOLLO_VCS_COMMIT: ${{ github.sha }}
+        with:
+          apollo-key: ${{ secrets.APOLLO_KEY }}
+          graph-ref: ${{ inputs.apollo_graph_ref }}
+          name: auth
+          schema: apps/auth/schema.graphql
+          no-url: true
+          check: true

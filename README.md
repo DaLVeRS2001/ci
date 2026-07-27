@@ -80,7 +80,9 @@ jobs:
     uses: DaLVeRS2001/ci/.github/workflows/pixaeron.yml@FULL_COMMIT_SHA
     with:
       service: ${{ inputs.service || 'all' }}
+      apollo_graph_ref: ${{ vars.APOLLO_GRAPH_REF }}
     secrets:
+      APOLLO_KEY: ${{ secrets.APOLLO_KEY }}
       VPS_HOST: ${{ secrets.VPS_HOST }}
       VPS_USER: ${{ secrets.VPS_USER }}
       VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
@@ -101,7 +103,8 @@ The `verify` job:
 5. installs Node.js 24 dependencies with `npm ci`;
 6. runs Nx affected lint, test, build, and e2e targets;
 7. builds affected deployable Dockerfiles on pull requests;
-8. returns an affected deployment matrix.
+8. returns an affected deployment matrix;
+9. runs a synchronous GraphOS check for the committed Auth subgraph SDL in a separate secret-bearing job on trusted runs.
 
 The `deploy` job runs only after successful verification, outside pull
 requests, for `refs/heads/main`, and through the caller's `production`
@@ -114,7 +117,8 @@ environment. It:
 5. configures SSH with a pinned `known_hosts` entry;
 6. uploads Compose, runtime env, and the versioned deployment script;
 7. logs the VPS into GHCR with the job token;
-8. invokes the remote deployment script.
+8. invokes the remote deployment script;
+9. publishes the exact deployed Auth schema to GraphOS with atomic checks after the remote health check succeeds.
 
 The remote script backs up live deployment files, validates Compose, pulls the
 selected service and dependencies, runs an optional backward-compatible
@@ -129,17 +133,22 @@ Pages remains supported but is no longer the preferred starting point. The reusa
 workflow is deliberately Pixaeron-specific and does not introduce a speculative
 shared frontend action.
 
-The caller supplies only public build-time values:
+The caller supplies public build values plus the non-secret GraphOS graph reference:
 
 ```text
+APOLLO_GRAPH_REF=<graph-id>@production
 GRAPHQL_API_URL
 GOOGLE_CLIENT_ID
 TURNSTILE_SITE_KEY
 ```
 
-Pull requests and trusted `main` runs execute `npm ci`, `npm run check`, and a
-Wrangler dry run without deployment credentials. A trusted `main` run also
-uploads the exact verified `build/` directory as a one-day workflow artifact.
+Trusted runs use a dedicated `APOLLO_KEY` only to fetch the composed API schema
+with Rover before `npm ci`. The workflow requires the committed frontend schema
+snapshot to match GraphOS, then executes `npm run check` and a Wrangler dry run.
+Fork and Dependabot pull requests cannot receive repository secrets, so they use
+the committed snapshot while retaining the same local Codegen and build checks.
+A trusted `main` run uploads the exact verified `build/` directory as a one-day
+workflow artifact.
 The frontend repository then owns a small local deploy job. That job downloads
 the verified artifact and targets its protected `production` environment, where
 `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` are resolved.
@@ -161,6 +170,56 @@ central workflow requires Node.js 24 and expects the caller repository to own
 `wrangler.jsonc`, the exact Wrangler dependency, the Webpack build, and all
 application tests.
 
+## GraphOS Schema Registry
+
+Rover is pinned to 0.41.0 through Apollo's official Actions at immutable commit
+SHAs. Trusted runs synchronously check `apps/auth/schema.graphql` when Auth is selected or affected, against
+`APOLLO_GRAPH_REF`. After Auth deploys and passes its remote health check, the
+same commit's schema is published with `check: true` and `no-url: true`.
+`no-url` is intentional while GraphOS is schema-only and no private Router-to-Auth
+route exists; replace it with the private subgraph route when the gateway becomes
+runtime infrastructure.
+
+Trusted frontend runs fetch the composed API schema with `rover graph fetch`.
+They never introspect Auth or copy its subgraph SDL. `APOLLO_KEY` is scoped to the
+single Rover step and is never exposed to npm lifecycle scripts, Webpack, Docker
+builds, or application code.
+
+Bootstrap in this order:
+
+1. Create the graph in GraphOS Studio and choose the explicit `production` variant.
+2. On a trusted workstation, install Rover 0.41.0 and run `rover config auth`
+   with a personal key whose user can publish this graph.
+3. Check out the exact clean backend commit intended as the registry baseline.
+   From its repository root, verify the generated SDL before publishing:
+
+```powershell
+npm ci
+npm run schema:check
+rover subgraph publish <graph-id>@production `
+  --name auth `
+  --schema apps/auth/schema.graphql `
+  --no-url
+```
+
+4. Confirm that `production` now contains the `auth` subgraph.
+5. Create separate backend and frontend CI keys. On Free/Developer this requires
+   separate graph API keys; Standard/Enterprise can now use an Auth-scoped
+   subgraph key for backend check/publish. Use a Consumer/read-only graph key for
+   frontend fetch when that role is available.
+6. Add repository variable `APOLLO_GRAPH_REF=<graph-id>@production` and repository
+   secret `APOLLO_KEY` to each caller repository.
+7. Publish this central CI change and update the backend caller to its full SHA.
+8. Dispatch backend service `auth`. CI checks the existing baseline, deploys Auth,
+   and republishes the exact deployed schema after the health check.
+9. Pull the composed schema in frontend, commit the snapshot/generated client,
+   then update the frontend caller to the same central SHA.
+
+Without Router/Apollo telemetry, GraphOS still performs composition, build, and
+lint checks, but operation-history checks do not have representative production
+traffic. Do not enable asynchronous `--background` checks until the GraphOS
+GitHub integration is configured.
+
 ## Permissions And Secrets
 
 The caller job provides the maximum permission ceiling because a called
@@ -178,12 +237,17 @@ Application runtime secrets do not belong in this public repository.
 the Pixaeron repository/environment. Runtime application values remain in AWS
 Systems Manager Parameter Store.
 
+`APOLLO_KEY` is a CI integration credential, not an application runtime secret.
+Keep separate backend and frontend keys in their caller repositories. The backend
+key checks and publishes the Auth subgraph; the frontend key fetches the composed
+API schema. `APOLLO_GRAPH_REF` is a repository variable, not a secret. Neither
+value belongs in AWS Parameter Store or the browser bundle.
+
 The reusable backend deploy job declares `environment: production`; its AWS and
 VPS deployment configuration follows the backend workflow contract. Frontend
-deployment is intentionally different: its reusable workflow is secretless,
-while the frontend repository's local deploy job declares
-`environment: production` and reads that repository's Cloudflare environment
-secret directly.
+Cloudflare deployment remains different: the frontend repository's local deploy
+job declares `environment: production` and reads that repository's Cloudflare
+environment secret directly.
 
 ## SHA Versioning
 

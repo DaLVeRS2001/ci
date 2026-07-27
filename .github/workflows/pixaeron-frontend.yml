@@ -15,6 +15,13 @@ on:
         description: Public Cloudflare Turnstile site key
         required: true
         type: string
+      apollo_graph_ref:
+        description: GraphOS production graph in graph-id@production form
+        required: true
+        type: string
+    secrets:
+      APOLLO_KEY:
+        required: false
 
 permissions:
   actions: read
@@ -44,6 +51,50 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install Rover
+        if: >-
+          github.event_name != 'pull_request' ||
+          (
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            github.actor != 'dependabot[bot]'
+          )
+        uses: apollographql-gh-actions/install-rover@4e7208e7343acc2796d3bb2b35e4504ea10f0cb2 # Rover 0.41.0
+
+      - name: Fetch composed GraphOS API schema
+        if: >-
+          github.event_name != 'pull_request' ||
+          (
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            github.actor != 'dependabot[bot]'
+          )
+        env:
+          APOLLO_GRAPH_REF: ${{ inputs.apollo_graph_ref }}
+          APOLLO_KEY: ${{ secrets.APOLLO_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$APOLLO_GRAPH_REF" =~ ^[^@[:space:]]+@production$ ]] || { echo 'APOLLO_GRAPH_REF must use graph-id@production format.' >&2; exit 1; }
+          [[ -n "$APOLLO_KEY" ]] || { echo 'APOLLO_KEY is required for trusted GraphOS schema fetches.' >&2; exit 1; }
+          rover --skip-update-check graph fetch "$APOLLO_GRAPH_REF" --output graphql/schema.graphql
+
+      - name: Check committed GraphQL schema snapshot
+        if: >-
+          github.event_name != 'pull_request' ||
+          (
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            github.actor != 'dependabot[bot]'
+          )
+        shell: bash
+        run: |
+          git ls-files --error-unmatch graphql/schema.graphql > /dev/null || {
+            echo 'graphql/schema.graphql must remain a committed schema snapshot.' >&2
+            exit 1
+          }
+          git diff --exit-code -- graphql/schema.graphql || {
+            echo 'graphql/schema.graphql differs from the composed GraphOS API schema. Run npm run schema:pull and commit the result.' >&2
+            exit 1
+          }
 
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
