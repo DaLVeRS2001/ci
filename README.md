@@ -101,10 +101,11 @@ The `verify` job:
 3. validates `.github/deploy-services.json`;
 4. validates `docker-compose.production.yaml`;
 5. installs Node.js 24 dependencies with `npm ci`;
-6. runs Nx affected lint, test, build, and e2e targets;
+6. runs Nx affected lint, test, build, e2e, and GraphQL schema-check targets;
 7. builds affected deployable Dockerfiles on pull requests;
-8. returns an affected deployment matrix;
-9. runs a synchronous GraphOS check for the committed Auth subgraph SDL in a separate secret-bearing job on trusted runs.
+8. returns affected deployment and GraphOS subgraph matrices;
+9. runs a synchronous GraphOS check for every affected subgraph in a separate secret-bearing matrix job on trusted runs;
+10. reports one stable `Backend verification gate` for branch protection and deployment dependencies.
 
 The `deploy` job runs only after successful verification, outside pull
 requests, for `refs/heads/main`, and through the caller's `production`
@@ -118,7 +119,12 @@ environment. It:
 6. uploads Compose, runtime env, and the versioned deployment script;
 7. logs the VPS into GHCR with the job token;
 8. invokes the remote deployment script;
-9. publishes the exact deployed Auth schema to GraphOS with atomic checks after the remote health check succeeds.
+9. publishes the exact deployed schema for each GraphQL subgraph with atomic checks after that service passes its remote health check.
+
+All backend production deployment rows share a non-cancelling `queue: max`
+concurrency group. GitHub therefore deploys them one at a time without
+replacing older pending services when a matrix or another workflow run adds
+more work.
 
 The remote script backs up live deployment files, validates Compose, pulls the
 selected service and dependencies, runs an optional backward-compatible
@@ -136,7 +142,7 @@ shared frontend action.
 The caller supplies public build values plus the non-secret GraphOS graph reference:
 
 ```text
-APOLLO_GRAPH_REF=<graph-id>@production
+APOLLO_GRAPH_REF=pixaeron@production
 GRAPHQL_API_URL
 GOOGLE_CLIENT_ID
 TURNSTILE_SITE_KEY
@@ -146,7 +152,7 @@ Trusted runs use a dedicated `APOLLO_KEY` only to fetch the composed API schema
 with Rover before `npm ci`. The workflow requires the committed frontend schema
 snapshot to match GraphOS, then executes `npm run check` and a Wrangler dry run.
 Fork and Dependabot pull requests cannot receive repository secrets, so they use
-the committed snapshot while retaining the same local Codegen and build checks.
+the committed snapshot while retaining the same non-writing `codegen:check` and build checks.
 A trusted `main` run uploads the exact verified `build/` directory as a one-day
 workflow artifact.
 The frontend repository then owns a small local deploy job. That job downloads
@@ -173,41 +179,77 @@ application tests.
 ## GraphOS Schema Registry
 
 Rover is pinned to 0.41.0 through Apollo's official Actions at immutable commit
-SHAs. Trusted runs synchronously check `apps/auth/schema.graphql` when Auth is selected or affected, against
-`APOLLO_GRAPH_REF`. After Auth deploys and passes its remote health check, the
-same commit's schema is published with `check: true` and `no-url: true`.
-`no-url` is intentional while GraphOS is schema-only and no private Router-to-Auth
-route exists; replace it with the private subgraph route when the gateway becomes
-runtime infrastructure.
+SHAs. The backend workflow discovers GraphQL subgraphs from Nx application projects
+that expose a `schema-check` target. Each discovered project must also expose
+`schema-export`, use its Nx project name as the GraphOS subgraph name, and commit
+its SDL at `<projectRoot>/schema.graphql`.
+
+Trusted runs check every affected subgraph through one GitHub Actions matrix. The
+Docker-based Rover check and publish steps set `APOLLO_CONFIG_HOME=/tmp/rover`
+because their container user cannot write the GitHub-mounted default configuration
+directory. A stable `Backend verification gate` aggregates local Nx verification
+and the optional matrix so branch protection never depends on dynamic job names.
+After its first successful caller run, add that exact gate to the caller repository's `main` ruleset; do not require individual matrix children.
+
+After a deployable subgraph passes its own remote health check, that matrix row
+publishes the same commit's SDL with `check: true` and `no-url: true`. GraphOS
+then composes the latest published SDL from every subgraph into one API schema.
+`no-url` is intentional while GraphOS is schema-only and no private Router-to-subgraph
+routes exist; replace it with each private route when the gateway becomes runtime
+infrastructure.
 
 Trusted frontend runs fetch the composed API schema with `rover graph fetch`.
-They never introspect Auth or copy its subgraph SDL. `APOLLO_KEY` is scoped to the
-single Rover step and is never exposed to npm lifecycle scripts, Webpack, Docker
-builds, or application code.
+They never introspect individual services or copy a subgraph SDL. `APOLLO_KEY` is
+scoped to the Rover step and is never exposed to npm lifecycle scripts, Webpack,
+Docker builds, or application code.
 
 Bootstrap in this order:
 
 1. Create the graph in GraphOS Studio and choose the explicit `production` variant.
-2. On a trusted workstation, install Rover 0.41.0 and run `rover config auth`
-   with a personal key whose user can publish this graph.
+2. On a trusted Windows workstation, download Rover 0.41.0 through Apollo's official [installation guide](https://www.apollographql.com/docs/rover/getting-started).
+   Use the binary-download option, add it to `PATH`, and authenticate Rover. `config auth` is interactive: paste the personal key at its prompt, not after the command.
+
+```powershell
+rover --version
+rover config auth
+rover config whoami
+```
+
+The local profile is for developer commands only. CI uses its repository
+`APOLLO_KEY`; that environment variable overrides the local Rover profile.
+
 3. Check out the exact clean backend commit intended as the registry baseline.
    From its repository root, verify the generated SDL before publishing:
 
 ```powershell
 npm ci
 npm run schema:check
-rover subgraph publish <graph-id>@production `
+rover subgraph publish pixaeron@production `
   --name auth `
-  --schema apps/auth/schema.graphql `
-  --no-url
+  --schema .\apps\auth\schema.graphql `
+  --no-url `
+  --check
 ```
 
-4. Confirm that `production` now contains the `auth` subgraph.
-5. Create separate backend and frontend CI keys. On Free/Developer this requires
-   separate graph API keys; Standard/Enterprise can now use an Auth-scoped
-   subgraph key for backend check/publish. Use a Consumer/read-only graph key for
-   frontend fetch when that role is available.
-6. Add repository variable `APOLLO_GRAPH_REF=<graph-id>@production` and repository
+4. Confirm the result with read-only commands:
+
+```powershell
+rover subgraph list pixaeron@production
+rover subgraph check pixaeron@production --name auth --schema .\apps\auth\schema.graphql
+rover graph fetch pixaeron@production
+```
+
+Manual `subgraph publish` changes registry state and is only for bootstrap or
+recovery. Routine publication belongs to the post-health-check CI step.
+
+5. Create separate backend and frontend CI keys. On the current Free plan these
+   are graph API keys with full graph access; separation still allows independent
+   rotation and revocation. Standard/Enterprise can instead use one backend
+   subgraph API key whose resources include every subgraph and variant handled by
+   this workflow. Add each new backend subgraph to that key before enabling its CI
+   target. Consumer/read-only graph-key roles require Enterprise.
+
+6. Add repository variable `APOLLO_GRAPH_REF=pixaeron@production` and repository
    secret `APOLLO_KEY` to each caller repository.
 7. Publish this central CI change and update the backend caller to its full SHA.
 8. Dispatch backend service `auth`. CI checks the existing baseline, deploys Auth,
@@ -239,7 +281,7 @@ Systems Manager Parameter Store.
 
 `APOLLO_KEY` is a CI integration credential, not an application runtime secret.
 Keep separate backend and frontend keys in their caller repositories. The backend
-key checks and publishes the Auth subgraph; the frontend key fetches the composed
+key checks and publishes backend subgraphs; the frontend key fetches the composed
 API schema. `APOLLO_GRAPH_REF` is a repository variable, not a secret. Neither
 value belongs in AWS Parameter Store or the browser bundle.
 
@@ -287,7 +329,9 @@ script used by an already-reviewed Pixaeron workflow.
 
 `Validate CI repository` runs on pull requests and pushes to `main`. It:
 
-- parses the workflow files through GitHub Actions;
+- lints workflow files with pinned actionlint 1.7.12;
+- ignores only its known false positive for GitHub's newer official
+  `concurrency.queue` key;
 - runs `bash -n` against the Pixaeron deployment script;
 - invokes the composite action locally;
 - verifies that the action returns an existing script path.
@@ -309,8 +353,16 @@ Do not change the Pixaeron workflow or action merely to make another project's
 deployment fit. Extract a shared action only after both implementations have
 demonstrably identical mechanics.
 
-## Official GitHub References
+## Official references
 
+- [Rover authentication](https://www.apollographql.com/docs/rover/configuring)
+- [Rover subgraph commands](https://www.apollographql.com/docs/rover/commands/subgraphs)
+- [Rover graph commands](https://www.apollographql.com/docs/rover/commands/graphs)
+- [Publishing subgraph schemas](https://www.apollographql.com/docs/graphos/platform/schema-management/delivery/publishing/rover)
+- [GitHub Actions matrices](https://docs.github.com/en/actions/using-jobs/using-a-matrix-for-your-jobs)
+- [GitHub Actions concurrency queues](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency)
+- [GraphOS graph API keys](https://www.apollographql.com/docs/graphos/platform/access-management/api-keys/graph-api-keys)
+- [GraphOS subgraph API keys](https://www.apollographql.com/docs/graphos/platform/access-management/api-keys/subgraph-api-keys)
 - [Reusable workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows)
 - [Cloudflare Workers Static Assets](https://developers.cloudflare.com/workers/static-assets/)
 - [Cloudflare SPA routing](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/)

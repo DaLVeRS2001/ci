@@ -75,7 +75,8 @@ jobs:
     outputs:
       deploy_matrix: ${{ steps.deploy_matrix.outputs.matrix }}
       has_deployments: ${{ steps.deploy_matrix.outputs.has_deployments }}
-      auth_schema_check_required: ${{ steps.deploy_matrix.outputs.auth_schema_check_required }}
+      subgraph_matrix: ${{ steps.deploy_matrix.outputs.subgraph_matrix }}
+      graphos_check_required: ${{ steps.deploy_matrix.outputs.graphos_check_required }}
 
     steps:
       - name: Checkout repository
@@ -163,9 +164,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Lint, test, and build affected projects
+      - name: Verify affected projects
         if: github.event_name != 'workflow_dispatch'
-        run: npx nx affected -t lint test build
+        run: |
+          npx nx affected -t lint test build
+          npx nx affected -t schema-check
 
       - name: Run affected end-to-end tests
         if: github.event_name != 'workflow_dispatch'
@@ -189,6 +192,7 @@ jobs:
           fi
 
           npx nx run-many -t lint test build --projects="$projects"
+          npx nx run-many -t schema-check --projects="$projects"
           npx nx run-many -t e2e
 
       - name: Build deployable Docker images
@@ -213,6 +217,7 @@ jobs:
         id: deploy_matrix
         env:
           SERVICE_INPUT: ${{ inputs.service || 'all' }}
+          TRUSTED_GRAPHOS_RUN: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -248,8 +253,68 @@ jobs:
               .github/deploy-services.json)"
           fi
 
-          matrix="$(jq -cn --argjson include "$selected" '{include: $include}')"
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          subgraph_projects="$(npx nx show projects --type app --withTarget schema-check --json)"
+          subgraphs='[]'
+
+          while IFS= read -r project; do
+            [[ "$project" =~ ^[A-Za-z][A-Za-z0-9_-]{0,63}$ ]] || {
+              echo "Nx project name is not a valid GraphOS subgraph name: $project" >&2
+              exit 1
+            }
+
+            project_config="$(npx nx show project "$project" --json)"
+            jq -e '.targets["schema-export"] != null' <<< "$project_config" > /dev/null || {
+              echo "GraphQL subgraph project is missing the schema-export target: $project" >&2
+              exit 1
+            }
+
+            project_root="$(jq -r '.root // empty' <<< "$project_config")"
+            [[ -n "$project_root" ]] || {
+              echo "Nx project has no root: $project" >&2
+              exit 1
+            }
+
+            schema="$project_root/schema.graphql"
+            [[ -f "$schema" ]] || {
+              echo "GraphQL subgraph schema not found: $schema" >&2
+              exit 1
+            }
+            git ls-files --error-unmatch "$schema" > /dev/null || {
+              echo "GraphQL subgraph schema must be committed: $schema" >&2
+              exit 1
+            }
+
+            subgraphs="$(
+              jq -c \
+                --arg project "$project" \
+                --arg name "$project" \
+                --arg schema "$schema" \
+                '. + [{ project: $project, name: $name, schema: $schema }]' \
+                <<< "$subgraphs"
+            )"
+          done < <(jq -r '.[]' <<< "$subgraph_projects")
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$SERVICE_INPUT" == "all" ]]; then
+              selected_subgraphs="$subgraphs"
+            else
+              selected_subgraphs="$(jq -c --arg project "$SERVICE_INPUT" '[.[] | select(.project == $project)]' <<< "$subgraphs")"
+            fi
+          else
+            selected_subgraphs="$(jq -c --argjson affected "$affected" '[.[] | select(.project as $project | ($affected | index($project)))]' <<< "$subgraphs")"
+          fi
+
+          selected="$(jq -c --argjson subgraphs "$subgraphs" '
+            map(. as $deployment |
+              (($subgraphs | map(select(.project == $deployment.project)) | .[0]) // null) as $subgraph |
+              if $subgraph == null then . else . + { subgraph: $subgraph } end
+            )
+          ' <<< "$selected")"
+
+          deploy_matrix="$(jq -cn --argjson include "$selected" '{include: $include}')"
+          subgraph_matrix="$(jq -cn --argjson include "$selected_subgraphs" '{include: $include}')"
+          echo "matrix=$deploy_matrix" >> "$GITHUB_OUTPUT"
+          echo "subgraph_matrix=$subgraph_matrix" >> "$GITHUB_OUTPUT"
 
           if jq -e 'length > 0' <<< "$selected" > /dev/null; then
             echo "has_deployments=true" >> "$GITHUB_OUTPUT"
@@ -257,29 +322,24 @@ jobs:
             echo "has_deployments=false" >> "$GITHUB_OUTPUT"
           fi
 
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            auth_schema_check_required="$(jq -r 'any(.[]; .project == "auth")' <<< "$selected")"
+          if jq -e 'length > 0' <<< "$selected_subgraphs" > /dev/null && [[ "$TRUSTED_GRAPHOS_RUN" == "true" ]]; then
+            echo "graphos_check_required=true" >> "$GITHUB_OUTPUT"
           else
-            auth_schema_check_required="$(jq -r 'index("auth") != null' <<< "$affected")"
+            echo "graphos_check_required=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "auth_schema_check_required=$auth_schema_check_required" >> "$GITHUB_OUTPUT"
 
   graphos-check:
-    name: Check Auth schema in GraphOS
+    name: Check ${{ matrix.name }} schema in GraphOS
     needs: verify
     if: >-
       needs.verify.result == 'success' &&
-      needs.verify.outputs.auth_schema_check_required == 'true' &&
-      (
-        github.event_name != 'pull_request' ||
-        (
-          github.event.pull_request.head.repo.full_name == github.repository &&
-          github.actor != 'dependabot[bot]'
-        )
-      )
+      needs.verify.outputs.graphos_check_required == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.verify.outputs.subgraph_matrix) }}
 
     steps:
       - name: Checkout repository
@@ -295,32 +355,63 @@ jobs:
           [[ "$APOLLO_GRAPH_REF" =~ ^[^@[:space:]]+@production$ ]] || { echo 'APOLLO_GRAPH_REF must use graph-id@production format.' >&2; exit 1; }
           [[ -n "$APOLLO_KEY" ]] || { echo 'APOLLO_KEY is required for trusted GraphOS checks.' >&2; exit 1; }
 
-      - name: Check Auth subgraph schema
+      - name: Check subgraph schema
         uses: apollographql-gh-actions/rover-subgraph-check@6b0bfef2687fc4004bb89c5228050d5151bd6ec3 # Rover 0.41.0
         env:
+          APOLLO_CONFIG_HOME: /tmp/rover
           APOLLO_VCS_BRANCH: ${{ github.head_ref || github.ref_name }}
           APOLLO_VCS_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         with:
           apollo-key: ${{ secrets.APOLLO_KEY }}
           graph-ref: ${{ inputs.apollo_graph_ref }}
-          name: auth
-          schema: apps/auth/schema.graphql
+          name: ${{ matrix.name }}
+          schema: ${{ matrix.schema }}
+
+  verification-gate:
+    name: Backend verification gate
+    needs:
+      - verify
+      - graphos-check
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Evaluate required checks
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          GRAPHOS_CHECK_REQUIRED: ${{ needs.verify.outputs.graphos_check_required }}
+          GRAPHOS_CHECK_RESULT: ${{ needs.graphos-check.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "$VERIFY_RESULT" == "success" ]] || {
+            echo "Project verification did not succeed: $VERIFY_RESULT" >&2
+            exit 1
+          }
+
+          if [[ "$GRAPHOS_CHECK_REQUIRED" == "true" ]]; then
+            [[ "$GRAPHOS_CHECK_RESULT" == "success" ]] || {
+              echo "Required GraphOS schema checks did not succeed: $GRAPHOS_CHECK_RESULT" >&2
+              exit 1
+            }
+          else
+            [[ "$GRAPHOS_CHECK_RESULT" == "skipped" ]] || {
+              echo "GraphOS schema checks ran unexpectedly: $GRAPHOS_CHECK_RESULT" >&2
+              exit 1
+            }
+          fi
 
   deploy:
     name: Deploy ${{ matrix.project }}
     needs:
       - verify
-      - graphos-check
+      - verification-gate
     if: >-
-      always() &&
       needs.verify.result == 'success' &&
-      (
-        needs.graphos-check.result == 'success' ||
-        (
-          needs.graphos-check.result == 'skipped' &&
-          needs.verify.outputs.auth_schema_check_required == 'false'
-        )
-      ) &&
+      needs.verification-gate.result == 'success' &&
       needs.verify.outputs.has_deployments == 'true' &&
       github.event_name != 'pull_request' &&
       github.ref == 'refs/heads/main'
@@ -329,6 +420,7 @@ jobs:
     concurrency:
       group: pixaeron-production
       cancel-in-progress: false
+      queue: max
 
     permissions:
       actions: read
@@ -506,16 +598,17 @@ jobs:
 
           ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" "$remote_command"
 
-      - name: Publish Auth schema to GraphOS
-        if: matrix.project == 'auth'
+      - name: Publish subgraph schema to GraphOS
+        if: ${{ matrix.subgraph != null }}
         uses: apollographql-gh-actions/rover-subgraph-publish@c9891df6980a56ca2ccd0374e83e664453222ee6 # Rover 0.41.0
         env:
+          APOLLO_CONFIG_HOME: /tmp/rover
           APOLLO_VCS_BRANCH: ${{ github.ref_name }}
           APOLLO_VCS_COMMIT: ${{ github.sha }}
         with:
           apollo-key: ${{ secrets.APOLLO_KEY }}
           graph-ref: ${{ inputs.apollo_graph_ref }}
-          name: auth
-          schema: apps/auth/schema.graphql
+          name: ${{ matrix.subgraph.name }}
+          schema: ${{ matrix.subgraph.schema }}
           no-url: true
           check: true
