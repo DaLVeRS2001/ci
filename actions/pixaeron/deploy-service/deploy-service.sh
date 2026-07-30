@@ -62,6 +62,11 @@ rollback() {
   docker compose --env-file "$deployment_env" -f "$compose_file" \
     logs --tail=100 "$compose_service"
 
+  if ! $had_previous_image; then
+    docker compose --env-file "$deployment_env" -f "$compose_file" \
+      rm --stop --force "$compose_service"
+  fi
+
   if $had_compose; then
     mv -f "$compose_backup" "$compose_file"
   else
