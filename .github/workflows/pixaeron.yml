@@ -95,6 +95,9 @@ jobs:
             length > 0 and
             all(.[];
               (.project | type) == "string" and
+              (.deploymentOrder | type) == "number" and
+              (.deploymentOrder | floor) == .deploymentOrder and
+              (.deploymentOrder >= 0) and
               (.imageName | type) == "string" and
               (.dockerfile | type) == "string" and
               (.composeService | type) == "string" and
@@ -113,6 +116,7 @@ jobs:
               (.migrationCommand | type) == "string"
             ) and
             ([.[].project] | length) == ([.[].project] | unique | length) and
+            ([.[].deploymentOrder] | length) == ([.[].deploymentOrder] | unique | length) and
             ([.[].composeService] | length) == ([.[].composeService] | unique | length) and
             ([.[].imageTagEnv] | length) == ([.[].imageTagEnv] | unique | length) and
             ([.[].runtimeEnvFileEnv] | length) == ([.[].runtimeEnvFileEnv] | unique | length)
@@ -313,6 +317,31 @@ jobs:
             )"
           done < <(jq -r '.[]' <<< "$subgraph_projects")
 
+          gateway_count="$(jq '[.[] | select(.project == "gateway")] | length' .github/deploy-services.json)"
+          [[ "$gateway_count" == "1" ]] || {
+            echo 'Deployment manifest must contain exactly one Gateway row.' >&2
+            exit 1
+          }
+          gateway_order="$(jq -r '.[] | select(.project == "gateway") | .deploymentOrder' .github/deploy-services.json)"
+
+          while IFS= read -r project; do
+            deployment_count="$(
+              jq --arg project "$project" '[.[] | select(.project == $project)] | length' .github/deploy-services.json
+            )"
+            [[ "$deployment_count" == "1" ]] || {
+              echo "GraphQL subgraph must have exactly one deployment manifest row: $project" >&2
+              exit 1
+            }
+
+            deployment_order="$(
+              jq -r --arg project "$project" '.[] | select(.project == $project) | .deploymentOrder' .github/deploy-services.json
+            )"
+            (( deployment_order < gateway_order )) || {
+              echo "GraphQL subgraph $project must deploy before Gateway." >&2
+              exit 1
+            }
+          done < <(jq -r '.[].project' <<< "$subgraphs")
+
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             if [[ "$SERVICE_INPUT" == "all" ]]; then
               selected_subgraphs="$subgraphs"
@@ -323,11 +352,34 @@ jobs:
             selected_subgraphs="$(jq -c --argjson affected "$affected" '[.[] | select(.project as $project | ($affected | index($project)))]' <<< "$subgraphs")"
           fi
 
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$SERVICE_INPUT" != "all" ]]; then
+            if [[ "$SERVICE_INPUT" == "gateway" ]] ||
+              jq -e 'length > 0' <<< "$selected_subgraphs" > /dev/null; then
+              echo 'A subgraph or Gateway release must use service=all so the static supergraph stays aligned.' >&2
+              exit 1
+            fi
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]] &&
+            jq -e 'length > 1' <<< "$selected_subgraphs" > /dev/null; then
+            echo 'Multi-subgraph releases require one batch GraphOS publishSubgraphs operation.' >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]] &&
+            jq -e 'length > 0' <<< "$selected_subgraphs" > /dev/null; then
+            selected="$(jq -c --argjson selected "$selected" '
+              ($selected | map(.project) + ["gateway"] | unique) as $projects |
+              [.[] | select(.project as $project | $projects | index($project))]
+            ' .github/deploy-services.json)"
+          fi
+
           selected="$(jq -c --argjson subgraphs "$subgraphs" '
             map(. as $deployment |
               (($subgraphs | map(select(.project == $deployment.project)) | .[0]) // null) as $subgraph |
               if $subgraph == null then . else . + { subgraph: $subgraph } end
-            )
+            ) |
+            sort_by(.deploymentOrder)
           ' <<< "$selected")"
 
           deploy_matrix="$(jq -cn --argjson include "$selected" '{include: $include}')"
@@ -423,8 +475,8 @@ jobs:
             }
           fi
 
-  deploy:
-    name: Deploy ${{ matrix.project }}
+  build-images:
+    name: Build ${{ matrix.project }} image
     needs:
       - verify
       - verification-gate
@@ -435,16 +487,8 @@ jobs:
       github.event_name != 'pull_request' &&
       github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    environment: production
-    concurrency:
-      group: pixaeron-production
-      cancel-in-progress: false
-      queue: max
-
     permissions:
-      actions: read
       contents: read
-      id-token: write
       packages: write
 
     strategy:
@@ -453,8 +497,6 @@ jobs:
 
     env:
       IMAGE_TAG: sha-${{ github.sha }}
-      VPS_HOST: ${{ secrets.VPS_HOST }}
-      VPS_USER: ${{ secrets.VPS_USER }}
 
     steps:
       - name: Checkout repository
@@ -476,78 +518,72 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
-          tags: |
-            ${{ matrix.imageName }}:${{ env.IMAGE_TAG }}
-            ${{ matrix.imageName }}:latest
+          tags: ${{ matrix.imageName }}:${{ env.IMAGE_TAG }}
           cache-from: type=gha,scope=${{ matrix.project }}
           cache-to: type=gha,mode=max,scope=${{ matrix.project }}
 
+  deploy-release:
+    name: Deploy ordered release
+    needs:
+      - verify
+      - verification-gate
+      - build-images
+    if: >-
+      needs.verify.result == 'success' &&
+      needs.verification-gate.result == 'success' &&
+      needs.build-images.result == 'success' &&
+      needs.verify.outputs.has_deployments == 'true' &&
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: pixaeron-production
+      cancel-in-progress: false
+      queue: max
+
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      packages: read
+
+    env:
+      DEPLOYMENTS: ${{ needs.verify.outputs.deploy_matrix }}
+      IMAGE_TAG: sha-${{ github.sha }}
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Reject stale production release
+        id: release_guard
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          current_main_sha="$(git ls-remote --exit-code origin refs/heads/main | awk 'NR == 1 { print $1 }')"
+          if [[ "$current_main_sha" != "$GITHUB_SHA" ]]; then
+            echo "Skipping stale release $GITHUB_SHA; main is $current_main_sha."
+            echo 'deploy=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo 'deploy=true' >> "$GITHUB_OUTPUT"
+
       - name: Configure AWS credentials
+        if: steps.release_guard.outputs.deploy == 'true'
         uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Generate runtime env file
-        env:
-          SSM_PATH: ${{ matrix.ssmPath }}
-          SECURE_PARAMETERS: ${{ toJson(matrix.secureParameters) }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          parameters="$(
-            aws ssm get-parameters-by-path \
-              --path "$SSM_PATH" \
-              --recursive \
-              --with-decryption \
-              --query 'Parameters' \
-              --output json
-          )"
-
-          prefix="$SSM_PATH/"
-          jq -e --arg prefix "$prefix" '
-            length > 0 and
-            all(.[];
-              (.Name | startswith($prefix)) and
-              ((.Name | ltrimstr($prefix)) | test("^[A-Z_][A-Z0-9_]*$")) and
-              (.Value | contains("\u0000") | not) and
-              (.Value | contains("\n") | not) and
-              (.Value | contains("\r") | not)
-            ) and
-            ([.[] | .Name | ltrimstr($prefix)] | length) ==
-            ([.[] | .Name | ltrimstr($prefix)] | unique | length)
-          ' <<< "$parameters" > /dev/null || {
-            echo "No valid, unique environment parameters found under $SSM_PATH." >&2
-            exit 1
-          }
-
-          while IFS= read -r key; do
-            parameter_type="$(
-              jq -r --arg name "$prefix$key" '
-                first(.[] | select(.Name == $name) | .Type) // ""
-              ' <<< "$parameters"
-            )"
-
-            if [[ "$parameter_type" != 'SecureString' ]]; then
-              echo "$prefix$key must exist and use the SecureString type." >&2
-              exit 1
-            fi
-          done < <(jq -r '.[]' <<< "$SECURE_PARAMETERS")
-
-          umask 077
-          : > service.env
-
-          while IFS=$'\t' read -r name encoded_value; do
-            key="${name#"$prefix"}"
-            value="$(printf '%s' "$encoded_value" | base64 --decode)"
-            printf '%s=%s\n' "$key" "$value" >> service.env
-          done < <(
-            jq -r 'sort_by(.Name)[] | [.Name, (.Value | @base64)] | @tsv' \
-              <<< "$parameters"
-          )
-
       - name: Configure SSH
+        if: steps.release_guard.outputs.deploy == 'true'
         env:
           VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
           VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
@@ -562,32 +598,12 @@ jobs:
           printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
 
       - name: Resolve versioned deployment script
+        if: steps.release_guard.outputs.deploy == 'true'
         id: deployment
-        uses: DaLVeRS2001/ci/actions/pixaeron/deploy-service@42e93fd26a74342af7656960b2b56d57069fe1bd
-
-      - name: Upload deployment files
-        env:
-          COMPOSE_SERVICE: ${{ matrix.composeService }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
-            'install -d -m 755 /opt/pixaeron'
-
-          scp -o BatchMode=yes \
-            docker-compose.production.yaml \
-            "$VPS_USER@$VPS_HOST:/opt/pixaeron/docker-compose.production.yaml.next"
-
-          scp -p -o BatchMode=yes \
-            service.env \
-            "$VPS_USER@$VPS_HOST:/opt/pixaeron/$COMPOSE_SERVICE.env.next"
-
-          scp -o BatchMode=yes \
-            "${{ steps.deployment.outputs.script_path }}" \
-            "$VPS_USER@$VPS_HOST:/opt/pixaeron/deploy-service.sh"
+        uses: DaLVeRS2001/ci/actions/pixaeron/deploy-service@132d8aee14fc705fb1487efdf50a466b8122c32b
 
       - name: Log in to GHCR on VPS
+        if: steps.release_guard.outputs.deploy == 'true'
         env:
           GHCR_TOKEN: ${{ github.token }}
         shell: bash
@@ -596,38 +612,133 @@ jobs:
 
           printf '%s' "$GHCR_TOKEN" | ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
             "docker login ghcr.io -u '${{ github.actor }}' --password-stdin"
-
-      - name: Deploy service on VPS
+      - name: Deploy services in manifest order
+        if: steps.release_guard.outputs.deploy == 'true'
         env:
-          COMPOSE_SERVICE: ${{ matrix.composeService }}
-          IMAGE_TAG_ENV: ${{ matrix.imageTagEnv }}
-          MIGRATION_COMMAND: ${{ matrix.migrationCommand }}
-          RUNTIME_ENV_FILE_ENV: ${{ matrix.runtimeEnvFileEnv }}
+          DEPLOYMENT_SCRIPT: ${{ steps.deployment.outputs.script_path }}
         shell: bash
         run: |
           set -euo pipefail
 
-          printf -v remote_command '%q ' \
-            bash /opt/pixaeron/deploy-service.sh \
-            "$COMPOSE_SERVICE" \
-            "$IMAGE_TAG_ENV" \
-            "$IMAGE_TAG" \
-            "$RUNTIME_ENV_FILE_ENV" \
-            "$MIGRATION_COMMAND"
+          runtime_dir="$RUNNER_TEMP/pixaeron-runtime"
+          install -m 700 -d "$runtime_dir"
 
-          ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" "$remote_command"
+          ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
+            'install -d -m 755 /opt/pixaeron'
+          scp -o BatchMode=yes "$DEPLOYMENT_SCRIPT" \
+            "$VPS_USER@$VPS_HOST:/opt/pixaeron/deploy-service.sh"
 
-      - name: Publish subgraph schema to GraphOS
-        if: ${{ matrix.subgraph != null }}
-        uses: apollographql-gh-actions/rover-subgraph-publish@c9891df6980a56ca2ccd0374e83e664453222ee6 # Rover 0.41.0
+          while IFS= read -r deployment; do
+            project="$(jq -r '.project' <<< "$deployment")"
+            compose_service="$(jq -r '.composeService' <<< "$deployment")"
+            image_tag_env="$(jq -r '.imageTagEnv' <<< "$deployment")"
+            migration_command="$(jq -r '.migrationCommand' <<< "$deployment")"
+            runtime_env_file_env="$(jq -r '.runtimeEnvFileEnv' <<< "$deployment")"
+            ssm_path="$(jq -r '.ssmPath' <<< "$deployment")"
+            secure_parameters="$(jq -c '.secureParameters' <<< "$deployment")"
+
+            echo "Deploying $project as release step $(jq -r '.deploymentOrder' <<< "$deployment")."
+
+            parameters="$(
+              aws ssm get-parameters-by-path \
+                --path "$ssm_path" \
+                --recursive \
+                --with-decryption \
+                --query 'Parameters' \
+                --output json
+            )"
+
+            prefix="$ssm_path/"
+            jq -e --arg prefix "$prefix" '
+              length > 0 and
+              all(.[];
+                (.Name | startswith($prefix)) and
+                ((.Name | ltrimstr($prefix)) | test("^[A-Z_][A-Z0-9_]*$")) and
+                (.Value | contains("\u0000") | not) and
+                (.Value | contains("\n") | not) and
+                (.Value | contains("\r") | not)
+              ) and
+              ([.[] | .Name | ltrimstr($prefix)] | length) ==
+              ([.[] | .Name | ltrimstr($prefix)] | unique | length)
+            ' <<< "$parameters" > /dev/null || {
+              echo "No valid, unique environment parameters found under $ssm_path." >&2
+              exit 1
+            }
+
+            while IFS= read -r key; do
+              parameter_type="$(
+                jq -r --arg name "$prefix$key" '
+                  first(.[] | select(.Name == $name) | .Type) // ""
+                ' <<< "$parameters"
+              )"
+
+              if [[ "$parameter_type" != 'SecureString' ]]; then
+                echo "$prefix$key must exist and use the SecureString type." >&2
+                exit 1
+              fi
+            done < <(jq -r '.[]' <<< "$secure_parameters")
+
+            service_env="$runtime_dir/$compose_service.env"
+            umask 077
+            : > "$service_env"
+
+            while IFS=$'\t' read -r name encoded_value; do
+              key="${name#"$prefix"}"
+              value="$(printf '%s' "$encoded_value" | base64 --decode)"
+              printf '%s=%s\n' "$key" "$value" >> "$service_env"
+            done < <(
+              jq -r 'sort_by(.Name)[] | [.Name, (.Value | @base64)] | @tsv' \
+                <<< "$parameters"
+            )
+
+            scp -o BatchMode=yes docker-compose.production.yaml \
+              "$VPS_USER@$VPS_HOST:/opt/pixaeron/docker-compose.production.yaml.next"
+            scp -p -o BatchMode=yes "$service_env" \
+              "$VPS_USER@$VPS_HOST:/opt/pixaeron/$compose_service.env.next"
+
+            printf -v remote_command '%q ' \
+              bash /opt/pixaeron/deploy-service.sh \
+              "$compose_service" \
+              "$image_tag_env" \
+              "$IMAGE_TAG" \
+              "$runtime_env_file_env" \
+              "$migration_command"
+
+            ssh -n -o BatchMode=yes "$VPS_USER@$VPS_HOST" "$remote_command"
+          done < <(jq -c '.include[]' <<< "$DEPLOYMENTS")
+
+      - name: Publish deployed subgraph schemas
+        if: >-
+          steps.release_guard.outputs.deploy == 'true' &&
+          needs.verify.outputs.graphos_check_required == 'true'
         env:
           APOLLO_CONFIG_HOME: /tmp/rover
+          APOLLO_GRAPH_REF: ${{ inputs.apollo_graph_ref }}
+          APOLLO_KEY: ${{ secrets.APOLLO_KEY }}
           APOLLO_VCS_BRANCH: ${{ github.ref_name }}
           APOLLO_VCS_COMMIT: ${{ github.sha }}
-        with:
-          apollo-key: ${{ secrets.APOLLO_KEY }}
-          graph-ref: ${{ inputs.apollo_graph_ref }}
-          name: ${{ matrix.subgraph.name }}
-          schema: ${{ matrix.subgraph.schema }}
-          no-url: true
-          check: true
+          SUBGRAPHS: ${{ needs.verify.outputs.subgraph_matrix }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r subgraph; do
+            name="$(jq -r '.name' <<< "$subgraph")"
+            schema="$(jq -r '.schema' <<< "$subgraph")"
+            echo "Publishing $name schema to GraphOS."
+
+            docker run --rm \
+              --env APOLLO_CONFIG_HOME \
+              --env APOLLO_KEY \
+              --env APOLLO_VCS_BRANCH \
+              --env APOLLO_VCS_COMMIT \
+              --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+              --workdir /workspace \
+              ghcr.io/apollographql/rover:0.41.0@sha256:ae42a40236050a5a410e7e4fd934ba5f851a6783666ff2f1e065ee5de6c2033d \
+              subgraph publish "$APOLLO_GRAPH_REF" \
+              --name "$name" \
+              --schema "$schema" \
+              --no-url \
+              --check \
+              --skip-update-check
+          done < <(jq -c '.include[]' <<< "$SUBGRAPHS")

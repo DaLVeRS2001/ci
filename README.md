@@ -103,33 +103,55 @@ The `verify` job:
 5. installs Node.js 24 dependencies with `npm ci`;
 6. runs Nx affected lint, test, build, e2e, and GraphQL schema-check targets;
 7. builds affected deployable Dockerfiles on pull requests;
-8. returns affected deployment and GraphOS subgraph matrices;
+8. validates that every discovered subgraph has one manifest row before the single Gateway row, then returns affected deployment and GraphOS subgraph matrices;
 9. runs a synchronous GraphOS check for every affected subgraph in a separate secret-bearing matrix job on trusted runs;
 10. reports one stable `Backend verification gate` for branch protection and deployment dependencies.
 
-The `deploy` job runs only after successful verification, outside pull
-requests, for `refs/heads/main`, and through the caller's `production`
-environment. It:
+Production rollout is split into two explicit jobs and runs only after
+successful verification, outside pull requests, for `refs/heads/main`:
 
-1. builds and pushes an immutable `sha-<pixaeron-commit>` image to GHCR;
-2. obtains temporary AWS credentials through GitHub OIDC;
-3. downloads and validates the service's AWS Parameter Store values;
-4. creates a mode-0600 runtime env file;
-5. configures SSH with a pinned `known_hosts` entry;
-6. uploads Compose, runtime env, and the versioned deployment script;
-7. logs the VPS into GHCR with the job token;
-8. invokes the remote deployment script;
-9. publishes the exact deployed schema for each GraphQL subgraph with atomic checks after that service passes its remote health check.
+1. `build-images` builds every selected service in a matrix and pushes only the
+   immutable `sha-<pixaeron-commit>` tag to GHCR. Production CI neither
+   publishes nor deploys a mutable `latest` tag.
+2. One `deploy-release` job starts only after the complete image matrix
+   succeeds. It enters the caller's protected `production` environment,
+   obtains temporary AWS credentials through GitHub OIDC, prepares each
+   service's mode-0600 runtime env file from Parameter Store, configures pinned
+   SSH host keys, and deploys the selected services sequentially. After every
+   remote health check succeeds, the same job publishes each affected subgraph
+   SDL from the deployed commit with GraphOS checks enabled.
 
-All backend production deployment rows share a non-cancelling `queue: max`
-concurrency group. GitHub therefore deploys them one at a time without
-replacing older pending services when a matrix or another workflow run adds
-more work.
+The application-owned deployment manifest provides a unique integer
+`deploymentOrder`. The workflow sorts by that field before deployment. The
+current manifest assigns Auth order 10 and Gateway order 100, so Gateway and
+its static Router supergraph are replaced last. CI requires exactly one Gateway
+row, exactly one manifest row for every discovered subgraph, and a lower order
+for every subgraph. A push that affects a subgraph automatically adds Gateway
+to the release selection even if the Nx dependency graph is incomplete.
+When another service is added, its manifest row joins the image matrix and the
+same ordered release without another copied deploy job.
 
-The remote script backs up live deployment files, validates Compose, pulls the
-selected service and dependencies, runs an optional backward-compatible
-migration, waits for health, restores the prior image/configuration on failure,
-and prunes old labeled service images after success.
+`deploy-release` owns the single non-cancelling `pixaeron-production`
+concurrency queue for both deployment and GraphOS publication. Once it acquires
+the queue, its stale-main guard compares the workflow commit with the current
+remote `main`; an older queued run exits without changing production. A manual
+release of a GraphQL subgraph or Gateway must use `service=all`, because either
+partial release could leave the static Gateway supergraph out of sync. Manual
+releases of unrelated non-subgraph services may remain service-specific.
+
+For every release step, the remote script backs up live deployment files,
+validates Compose, pulls the selected immutable image and dependencies, runs an
+optional backward-compatible migration, waits for health, and restores the
+prior image/configuration on failure. If a first deployment has no prior image,
+rollback removes the failed newly created service before restoring the previous
+files. Old labeled service images are pruned only after success.
+
+Rollback is deliberately per service, not a distributed transaction. If Auth
+is healthy and a later Gateway deployment fails, Auth remains on the new
+version. Every cross-service change must therefore use expand/contract: deploy
+a backward-compatible provider first, deploy its consumers afterward, and
+remove the old contract only in a later release. This keeps rollback readable
+without a custom cross-service rollback framework.
 
 ## Pixaeron Frontend Workflow
 
@@ -178,8 +200,9 @@ application tests.
 
 ## GraphOS Schema Registry
 
-Rover is pinned to 0.41.0 through Apollo's official Actions at immutable commit
-SHAs. The backend workflow discovers GraphQL subgraphs from Nx application projects
+Rover is pinned to 0.41.0: checks use Apollo's official Action at an immutable
+commit SHA, and release publication uses Apollo's official image at an immutable
+digest. The backend workflow discovers GraphQL subgraphs from Nx application projects
 that expose a `schema-check` target. Each discovered project must also expose
 `schema-export`, use its Nx project name as the GraphOS subgraph name, and commit
 its SDL at `<projectRoot>/schema.graphql`.
@@ -191,12 +214,20 @@ directory. A stable `Backend verification gate` aggregates local Nx verification
 and the optional matrix so branch protection never depends on dynamic job names.
 After its first successful caller run, add that exact gate to the caller repository's `main` ruleset; do not require individual matrix children.
 
-After a deployable subgraph passes its own remote health check, that matrix row
-publishes the same commit's SDL with `check: true` and `no-url: true`. GraphOS
-then composes the latest published SDL from every subgraph into one API schema.
-`no-url` is intentional while GraphOS is schema-only and no private Router-to-subgraph
-routes exist; replace it with each private route when the gateway becomes runtime
-infrastructure.
+After the complete ordered production release passes all remote health checks,
+the same serialized release job publishes each affected subgraph's SDL from the
+same commit with `--check` and `--no-url`. GraphOS then composes the latest
+published SDL from every subgraph into one API schema. `no-url` remains
+intentional because GraphOS is used for schema storage and checks, while the
+Gateway image contains the statically composed executable supergraph and its
+private subgraph routes.
+
+Rover remains the standard path while a release changes one subgraph. Its
+`--check` flow does not make several sequential subgraph publications one
+atomic update. Production CI therefore rejects a release selecting more than
+one subgraph SDL. Before Pixaeron needs a coordinated multi-subgraph release,
+replace that loop with one official GraphOS Platform API `publishSubgraphs`
+batch; do not copy more Rover jobs.
 
 Trusted frontend runs fetch the composed API schema with `rover graph fetch`.
 They never introspect individual services or copy a subgraph SDL. `APOLLO_KEY` is
@@ -252,8 +283,10 @@ recovery. Routine publication belongs to the post-health-check CI step.
 6. Add repository variable `APOLLO_GRAPH_REF=pixaeron@production` and repository
    secret `APOLLO_KEY` to each caller repository.
 7. Publish this central CI change and update the backend caller to its full SHA.
-8. Dispatch backend service `auth`. CI checks the existing baseline, deploys Auth,
-   and republishes the exact deployed schema after the health check.
+8. Dispatch backend service `all`. A manual release cannot target Auth or
+   Gateway alone because both must use the same static schema set. CI checks the
+   existing baseline, deploys the ordered release, and republishes the exact
+   deployed schema only after every health check succeeds.
 9. Pull the composed schema in frontend, commit the snapshot/generated client,
    then update the frontend caller to the same central SHA.
 
@@ -269,27 +302,56 @@ workflow can reduce permissions but cannot elevate them.
 
 - `actions: read` supports workflow/Nx metadata reads.
 - `contents: read` supports checkout.
-- `id-token: write` allows only the deploy job to request a short-lived OIDC
+- `id-token: write` allows only `deploy-release` to request a short-lived OIDC
   token; AWS IAM defines the real cloud permissions.
-- `packages: write` allows only the deploy job to publish the Docker image to
-  GHCR.
+- `packages: write` allows only the `build-images` job to publish immutable
+  Docker images to GHCR; `deploy-release` has read-only package access.
 
 Application runtime secrets do not belong in this public repository.
 `VPS_HOST`, `VPS_USER`, `VPS_SSH_PRIVATE_KEY`, and `VPS_KNOWN_HOSTS` remain in
 the Pixaeron repository/environment. Runtime application values remain in AWS
 Systems Manager Parameter Store.
 
-`APOLLO_KEY` is a CI integration credential, not an application runtime secret.
-Keep separate backend and frontend keys in their caller repositories. The backend
-key checks and publishes backend subgraphs; the frontend key fetches the composed
-API schema. `APOLLO_GRAPH_REF` is a repository variable, not a secret. Neither
-value belongs in AWS Parameter Store or the browser bundle.
+Two different credentials deliberately use the environment name `APOLLO_KEY`:
 
-The reusable backend deploy job declares `environment: production`; its AWS and
-VPS deployment configuration follows the backend workflow contract. Frontend
+- the backend and frontend caller repositories each keep a dedicated GitHub
+  Actions secret for Rover schema checks, publication, or composed-schema fetch;
+- Gateway keeps its separate Router runtime key as the SecureString
+  `/pixaeron/production/gateway/APOLLO_KEY` in AWS Systems Manager Parameter
+  Store. The ordered deploy reads it only into Gateway's runtime env file.
+
+The Router runtime key is not the backend CI key and must not be copied into the
+central workflow. `APOLLO_GRAPH_REF` remains non-secret configuration: callers
+supply it as a repository variable, while Gateway receives its runtime value
+through its own Parameter Store path. None of these values belongs in the
+browser bundle.
+
+The reusable backend `deploy-release` job declares `environment: production`;
+its AWS and VPS deployment configuration follows the backend workflow contract. Frontend
 Cloudflare deployment remains different: the frontend repository's local deploy
 job declares `environment: production` and reads that repository's Cloudflare
 environment secret directly.
+
+## Release Activation Status
+
+The ordered-release workflow and the first-deployment rollback fix described
+above are currently prepared in this local working tree only. Local files do not
+change an existing reusable workflow run. Pixaeron continues using the already
+published central CI commits until both immutable pins are rolled forward.
+
+Activate this change in this order:
+
+1. validate, commit, and publish the `deploy-service` rollback fix in this
+   repository;
+2. replace the deploy action SHA inside `pixaeron.yml` with that published
+   action commit, then validate, commit, and publish the workflow change;
+3. replace the backend caller's reusable-workflow SHA with the final workflow
+   commit and verify the Pixaeron pipeline.
+
+The deploy action and reusable workflow are separate dependencies. Until step 2,
+the locally edited workflow still resolves the previously pinned action and
+cannot use the local rollback fix. Until step 3, the backend consumer cannot use
+either central change. A central CI merge by itself never updates a consumer.
 
 ## SHA Versioning
 
@@ -358,8 +420,8 @@ demonstrably identical mechanics.
 - [Rover authentication](https://www.apollographql.com/docs/rover/configuring)
 - [Rover subgraph commands](https://www.apollographql.com/docs/rover/commands/subgraphs)
 - [Rover graph commands](https://www.apollographql.com/docs/rover/commands/graphs)
-- [Publishing subgraph schemas](https://www.apollographql.com/docs/graphos/platform/schema-management/delivery/publishing/rover)
-- [GitHub Actions matrices](https://docs.github.com/en/actions/using-jobs/using-a-matrix-for-your-jobs)
+- [Publishing schemas to GraphOS](https://www.apollographql.com/docs/graphos/platform/schema-management/delivery/publishing)
+- [GraphOS deployment best practices](https://www.apollographql.com/docs/graphos/platform/production-readiness/deployment-best-practices)
 - [GitHub Actions concurrency queues](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency)
 - [GraphOS graph API keys](https://www.apollographql.com/docs/graphos/platform/access-management/api-keys/graph-api-keys)
 - [GraphOS subgraph API keys](https://www.apollographql.com/docs/graphos/platform/access-management/api-keys/subgraph-api-keys)
