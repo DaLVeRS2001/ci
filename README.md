@@ -318,6 +318,12 @@ Application runtime secrets do not belong in this public repository.
 the Pixaeron repository/environment. Runtime application values remain in AWS
 Systems Manager Parameter Store.
 
+The application deployment manifest declares the SSM paths that CI reads, but
+it does not provision AWS IAM. Before activating a manifest path, extend the
+caller's deployment role with `ssm:GetParametersByPath` for that exact path.
+The runtime preflight fails closed before deployment when the role is missing
+that permission.
+
 Two different credentials deliberately use the environment name `APOLLO_KEY`:
 
 - the backend and frontend caller repositories each keep a dedicated GitHub

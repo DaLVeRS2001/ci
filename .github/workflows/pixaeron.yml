@@ -119,6 +119,7 @@ jobs:
             ([.[].deploymentOrder] | length) == ([.[].deploymentOrder] | unique | length) and
             ([.[].composeService] | length) == ([.[].composeService] | unique | length) and
             ([.[].imageTagEnv] | length) == ([.[].imageTagEnv] | unique | length) and
+            ([.[].ssmPath] | length) == ([.[].ssmPath] | unique | length) and
             ([.[].runtimeEnvFileEnv] | length) == ([.[].runtimeEnvFileEnv] | unique | length)
           ' .github/deploy-services.json > /dev/null
 
