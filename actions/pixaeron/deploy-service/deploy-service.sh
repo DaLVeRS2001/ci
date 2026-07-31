@@ -11,6 +11,7 @@ image_tag_env="$2"
 image_tag="$3"
 runtime_env_file_env="$4"
 migration_command="$5"
+deployment_phase='deployment setup'
 
 deployment_dir=/opt/pixaeron
 compose_file="$deployment_dir/docker-compose.production.yaml"
@@ -59,6 +60,9 @@ rollback() {
   trap - ERR
   set +e
 
+  printf 'Deployment of %s failed during %s (exit %d). Starting rollback.\n' \
+    "$compose_service" "$deployment_phase" "$exit_code" >&2
+
   docker compose --env-file "$deployment_env" -f "$compose_file" \
     logs --tail=100 "$compose_service"
 
@@ -98,6 +102,7 @@ rollback() {
 # the live deployment files untouched.
 trap rollback ERR
 
+deployment_phase='installing deployment files'
 mv -f "$incoming_compose" "$compose_file"
 mv -f "$incoming_runtime_env" "$runtime_env"
 chmod 600 "$runtime_env" "$deployment_env"
@@ -117,17 +122,22 @@ upsert_env_value PIXAERON_CERTS_DIR /opt/pixaeron/certs
 upsert_env_value "$runtime_env_file_env" "$runtime_env"
 upsert_env_value "$image_tag_env" "$image_tag"
 
+deployment_phase='Compose validation'
 docker compose --env-file "$deployment_env" -f "$compose_file" \
   config --quiet "$compose_service"
+
+deployment_phase='image pull'
 docker compose --env-file "$deployment_env" -f "$compose_file" pull --include-deps "$compose_service"
 
 if [[ -n "$migration_command" && "$migration_command" != 'null' ]]; then
+  deployment_phase='database migration'
   # Database migrations must remain backward-compatible: rollback restores the
   # previous application image, but intentionally does not mutate database history.
   docker compose --env-file "$deployment_env" -f "$compose_file" \
     run --rm --no-deps "$compose_service" sh -lc "$migration_command"
 fi
 
+deployment_phase='service startup and health check'
 docker compose --env-file "$deployment_env" -f "$compose_file" \
   up -d --wait --wait-timeout 90 "$compose_service"
 
