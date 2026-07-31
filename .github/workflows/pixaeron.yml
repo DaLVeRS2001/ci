@@ -600,7 +600,7 @@ jobs:
       - name: Resolve versioned deployment script
         if: steps.release_guard.outputs.deploy == 'true'
         id: deployment
-        uses: DaLVeRS2001/ci/actions/pixaeron/deploy-service@132d8aee14fc705fb1487efdf50a466b8122c32b
+        uses: DaLVeRS2001/ci/actions/pixaeron/deploy-service@308cddd6c5a6512deeaf44678b4f5695b6bf1d13
 
       - name: Log in to GHCR on VPS
         if: steps.release_guard.outputs.deploy == 'true'
@@ -612,32 +612,28 @@ jobs:
 
           printf '%s' "$GHCR_TOKEN" | ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
             "docker login ghcr.io -u '${{ github.actor }}' --password-stdin"
-      - name: Deploy services in manifest order
+      - name: Prepare runtime environments
         if: steps.release_guard.outputs.deploy == 'true'
-        env:
-          DEPLOYMENT_SCRIPT: ${{ steps.deployment.outputs.script_path }}
         shell: bash
         run: |
           set -euo pipefail
 
           runtime_dir="$RUNNER_TEMP/pixaeron-runtime"
           install -m 700 -d "$runtime_dir"
+          umask 077
 
-          ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
-            'install -d -m 755 /opt/pixaeron'
-          scp -o BatchMode=yes "$DEPLOYMENT_SCRIPT" \
-            "$VPS_USER@$VPS_HOST:/opt/pixaeron/deploy-service.sh"
+          prepare_runtime_env() {
+            local deployment="$1"
+            local project compose_service ssm_path secure_parameters
+            local parameters prefix key parameter_type service_env
+            local name encoded_value value
 
-          while IFS= read -r deployment; do
             project="$(jq -r '.project' <<< "$deployment")"
             compose_service="$(jq -r '.composeService' <<< "$deployment")"
-            image_tag_env="$(jq -r '.imageTagEnv' <<< "$deployment")"
-            migration_command="$(jq -r '.migrationCommand' <<< "$deployment")"
-            runtime_env_file_env="$(jq -r '.runtimeEnvFileEnv' <<< "$deployment")"
             ssm_path="$(jq -r '.ssmPath' <<< "$deployment")"
             secure_parameters="$(jq -c '.secureParameters' <<< "$deployment")"
 
-            echo "Deploying $project as release step $(jq -r '.deploymentOrder' <<< "$deployment")."
+            echo "Validating runtime configuration for $project."
 
             parameters="$(
               aws ssm get-parameters-by-path \
@@ -679,7 +675,6 @@ jobs:
             done < <(jq -r '.[]' <<< "$secure_parameters")
 
             service_env="$runtime_dir/$compose_service.env"
-            umask 077
             : > "$service_env"
 
             while IFS=$'\t' read -r name encoded_value; do
@@ -690,11 +685,62 @@ jobs:
               jq -r 'sort_by(.Name)[] | [.Name, (.Value | @base64)] | @tsv' \
                 <<< "$parameters"
             )
+          }
+
+          while IFS= read -r deployment; do
+            prepare_runtime_env "$deployment"
+          done < <(jq -c '.[]' .github/deploy-services.json)
+
+          ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
+            'install -d -m 755 /opt/pixaeron'
+
+          while IFS= read -r deployment; do
+            project="$(jq -r '.project' <<< "$deployment")"
+            compose_service="$(jq -r '.composeService' <<< "$deployment")"
+            service_env="$runtime_dir/$compose_service.env"
+            staged_env="/opt/pixaeron/$compose_service.env.next"
+            live_env="/opt/pixaeron/$compose_service.env"
+
+            scp -p -o BatchMode=yes "$service_env" \
+              "$VPS_USER@$VPS_HOST:$staged_env"
+
+            printf -v bootstrap_command \
+              'if [ ! -f %q ]; then install -m 600 -- %q %q; fi' \
+              "$live_env" "$staged_env" "$live_env"
+            ssh -n -o BatchMode=yes "$VPS_USER@$VPS_HOST" "$bootstrap_command"
+
+            echo "Runtime configuration for $project is ready."
+          done < <(jq -c '.[]' .github/deploy-services.json)
+
+      - name: Deploy services in manifest order
+        if: steps.release_guard.outputs.deploy == 'true'
+        env:
+          DEPLOYMENT_SCRIPT: ${{ steps.deployment.outputs.script_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          runtime_dir="$RUNNER_TEMP/pixaeron-runtime"
+          [[ -d "$runtime_dir" ]] || {
+            echo 'Prepared runtime environment directory is missing.' >&2
+            exit 1
+          }
+
+          scp -o BatchMode=yes "$DEPLOYMENT_SCRIPT" \
+            "$VPS_USER@$VPS_HOST:/opt/pixaeron/deploy-service.sh"
+
+          while IFS= read -r deployment; do
+            project="$(jq -r '.project' <<< "$deployment")"
+            deployment_order="$(jq -r '.deploymentOrder' <<< "$deployment")"
+            compose_service="$(jq -r '.composeService' <<< "$deployment")"
+            image_tag_env="$(jq -r '.imageTagEnv' <<< "$deployment")"
+            migration_command="$(jq -r '.migrationCommand' <<< "$deployment")"
+            runtime_env_file_env="$(jq -r '.runtimeEnvFileEnv' <<< "$deployment")"
+
+            echo "Deploying $project as release step $deployment_order."
 
             scp -o BatchMode=yes docker-compose.production.yaml \
               "$VPS_USER@$VPS_HOST:/opt/pixaeron/docker-compose.production.yaml.next"
-            scp -p -o BatchMode=yes "$service_env" \
-              "$VPS_USER@$VPS_HOST:/opt/pixaeron/$compose_service.env.next"
 
             printf -v remote_command '%q ' \
               bash /opt/pixaeron/deploy-service.sh \
@@ -704,8 +750,30 @@ jobs:
               "$runtime_env_file_env" \
               "$migration_command"
 
-            ssh -n -o BatchMode=yes "$VPS_USER@$VPS_HOST" "$remote_command"
+            if ! ssh -n -o BatchMode=yes "$VPS_USER@$VPS_HOST" "$remote_command"; then
+              echo "::error title=Deployment failed::$project failed during release step $deployment_order. Review the SSH or deployment error above."
+              exit 1
+            fi
           done < <(jq -c '.include[]' <<< "$DEPLOYMENTS")
+
+      - name: Clean up staged runtime environments
+        if: ${{ always() && steps.release_guard.outputs.deploy == 'true' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          if [[ ! -f ~/.ssh/id_ed25519 ]]; then
+            echo 'SSH was not configured; no remote staging cleanup is needed.'
+            exit 0
+          fi
+
+          while IFS= read -r compose_service; do
+            staged_env="/opt/pixaeron/$compose_service.env.next"
+            printf -v cleanup_command 'rm -f -- %q' "$staged_env"
+            if ! ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$VPS_USER@$VPS_HOST" "$cleanup_command"; then
+              echo "::warning title=Staging cleanup failed::Could not remove the staged $compose_service runtime environment."
+            fi
+          done < <(jq -r '.[].composeService' .github/deploy-services.json)
 
       - name: Publish deployed subgraph schemas
         if: >-

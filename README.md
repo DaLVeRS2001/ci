@@ -115,11 +115,12 @@ successful verification, outside pull requests, for `refs/heads/main`:
    publishes nor deploys a mutable `latest` tag.
 2. One `deploy-release` job starts only after the complete image matrix
    succeeds. It enters the caller's protected `production` environment,
-   obtains temporary AWS credentials through GitHub OIDC, prepares each
-   service's mode-0600 runtime env file from Parameter Store, configures pinned
-   SSH host keys, and deploys the selected services sequentially. After every
-   remote health check succeeds, the same job publishes each affected subgraph
-   SDL from the deployed commit with GraphOS checks enabled.
+   obtains temporary AWS credentials through GitHub OIDC, validates every
+   manifest service's Parameter Store hierarchy before changing a container,
+   stages all mode-0600 runtime env files, and then deploys only the selected
+   services sequentially. After every remote health check succeeds, the same
+   job publishes each affected subgraph SDL from the deployed commit with
+   GraphOS checks enabled.
 
 The application-owned deployment manifest provides a unique integer
 `deploymentOrder`. The workflow sorts by that field before deployment. The
@@ -139,12 +140,17 @@ release of a GraphQL subgraph or Gateway must use `service=all`, because either
 partial release could leave the static Gateway supergraph out of sync. Manual
 releases of unrelated non-subgraph services may remain service-specific.
 
-For every release step, the remote script backs up live deployment files,
-validates Compose, pulls the selected immutable image and dependencies, runs an
-optional backward-compatible migration, waits for health, and restores the
-prior image/configuration on failure. If a first deployment has no prior image,
-rollback removes the failed newly created service before restoring the previous
-files. Old labeled service images are pruned only after success.
+Before the first release step, CI uploads every validated runtime env. A missing
+live env is bootstrapped from that staged copy so Compose can resolve the whole
+project; an existing live env is not replaced until its service is selected for
+deployment. For every selected release step, the remote script backs up live
+deployment files, validates Compose, pulls the immutable image and dependencies,
+runs an optional backward-compatible migration, and waits for health. On
+failure it reports the failed phase before rollback and restores the prior
+service image/configuration. If no prior image exists, rollback removes the failed
+new service container. An `always()` final step attempts to remove staged
+runtime env copies after successful, failed, or cancelled releases; cleanup
+failures are warnings. Old labeled service images are pruned only after success.
 
 Rollback is deliberately per service, not a distributed transaction. If Auth
 is healthy and a later Gateway deployment fails, Auth remains on the new
@@ -334,24 +340,22 @@ environment secret directly.
 
 ## Release Activation Status
 
-The ordered-release workflow and the first-deployment rollback fix described
-above are currently prepared in this local working tree only. Local files do not
-change an existing reusable workflow run. Pixaeron continues using the already
-published central CI commits until both immutable pins are rolled forward.
+The runtime-env preflight and phase-aware rollback diagnostic in the current
+working tree do not affect an existing release until both immutable central CI
+pins are rolled forward.
 
 Activate this change in this order:
 
-1. validate, commit, and publish the `deploy-service` rollback fix in this
-   repository;
-2. replace the deploy action SHA inside `pixaeron.yml` with that published
-   action commit, then validate, commit, and publish the workflow change;
+1. validate, commit, and publish the `deploy-service` diagnostic change;
+2. replace the deploy action SHA inside `pixaeron.yml` with that action commit,
+   validate the runtime-env preflight, then commit and publish the workflow;
 3. replace the backend caller's reusable-workflow SHA with the final workflow
-   commit and verify the Pixaeron pipeline.
+   commit and verify a complete Pixaeron release.
 
 The deploy action and reusable workflow are separate dependencies. Until step 2,
-the locally edited workflow still resolves the previously pinned action and
-cannot use the local rollback fix. Until step 3, the backend consumer cannot use
-either central change. A central CI merge by itself never updates a consumer.
+the workflow still resolves the previously pinned action. Until step 3, the
+backend consumer cannot use either central change. A central CI merge by itself
+never updates a consumer.
 
 ## SHA Versioning
 
