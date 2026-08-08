@@ -96,14 +96,25 @@ instead of this example.
 
 The `verify` job:
 
-1. starts isolated PostgreSQL 18 and Redis 8 service containers;
+1. starts isolated PostgreSQL 18 and Redis 8 service containers, then creates
+   the separate Notifications database and role inside the CI PostgreSQL service;
 2. checks out the complete Pixaeron history;
 3. validates `.github/deploy-services.json`;
 4. validates `docker-compose.production.yaml`;
 5. installs Node.js 24 dependencies with `npm ci`;
-6. runs Nx affected lint, test, build, e2e, and GraphQL schema-check targets;
-7. builds affected deployable Dockerfiles on pull requests;
-8. validates that every discovered subgraph has one manifest row before the single Gateway row, then returns affected deployment and GraphOS subgraph matrices;
+6. runs every Nx `contracts-breaking` target against `NX_BASE` (or `main`
+   for a manual dispatch), then runs affected lint, test, build, e2e, GraphQL
+   schema-check, and service-owned database-integration targets;
+7. builds affected deployable Dockerfiles on pull requests; the Notifications image
+   then runs a container-level smoke test against a fresh PostgreSQL 18 database,
+   exercises the real gRPC wire contract on the private command network, proves
+   that the command alias is unreachable from the egress network, and verifies
+   that a failed database bootstrap terminates the process;
+8. validates that every discovered subgraph has one manifest row before the single
+   Gateway row, and, when Notifications is present, verifies its private Compose
+   topology, command-network-only gRPC bind, deployment order, runtime endpoint,
+   and absence of host ports; it then
+   returns affected deployment and GraphOS subgraph matrices;
 9. runs a synchronous GraphOS check for every affected subgraph in a separate secret-bearing matrix job on trusted runs;
 10. reports one stable `Backend verification gate` for branch protection and deployment dependencies.
 
@@ -124,11 +135,16 @@ successful verification, outside pull requests, for `refs/heads/main`:
 
 The application-owned deployment manifest provides a unique integer
 `deploymentOrder`. The workflow sorts by that field before deployment. The
-current manifest assigns Auth order 10 and Gateway order 100, so Gateway and
-its static Router supergraph are replaced last. CI requires exactly one Gateway
+current manifest assigns Notifications order 5, Auth order 10, and Gateway
+order 100. Notifications is therefore made healthy before Auth, while Gateway
+and its static Router supergraph are replaced last. CI requires exactly one Gateway
 row, exactly one manifest row for every discovered subgraph, and a lower order
-for every subgraph. A push that affects a subgraph automatically adds Gateway
+for every subgraph. When Notifications is present, CI also requires exactly one
+Auth row and fails unless Notifications has the lower deployment order. A push that affects a subgraph automatically adds Gateway
 to the release selection even if the Nx dependency graph is incomplete.
+Notifications is not a GraphQL subgraph, so it participates in image,
+runtime-env, migration, and ordered deployment matrices without entering the
+GraphOS matrix.
 When another service is added, its manifest row joins the image matrix and the
 same ordered release without another copied deploy job.
 
@@ -152,9 +168,9 @@ new service container. An `always()` final step attempts to remove staged
 runtime env copies after successful, failed, or cancelled releases; cleanup
 failures are warnings. Old labeled service images are pruned only after success.
 
-Rollback is deliberately per service, not a distributed transaction. If Auth
-is healthy and a later Gateway deployment fails, Auth remains on the new
-version. Every cross-service change must therefore use expand/contract: deploy
+Rollback is deliberately per service, not a distributed transaction. If
+Notifications and Auth are healthy and a later Gateway deployment fails, those
+services remain on the new version. Every cross-service change must therefore use expand/contract: deploy
 a backward-compatible provider first, deploy its consumers afterward, and
 remove the old contract only in a later release. This keeps rollback readable
 without a custom cross-service rollback framework.
@@ -322,7 +338,12 @@ The application deployment manifest declares the SSM paths that CI reads, but
 it does not provision AWS IAM. Before activating a manifest path, extend the
 caller's deployment role with `ssm:GetParametersByPath` for that exact path.
 The runtime preflight fails closed before deployment when the role is missing
-that permission.
+that permission. The Notifications manifest reads
+`/pixaeron/production/notifications`, requires its database URL, recipient HMAC
+key, and dedicated AWS runtime credentials to be `SecureString`, and writes them
+only to the mode-0600 Notifications runtime env file. Its database-integration
+target runs against a distinct PostgreSQL database; it never reuses Auth schema
+or migrations.
 
 Two different credentials deliberately use the environment name `APOLLO_KEY`:
 

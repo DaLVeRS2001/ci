@@ -58,6 +58,7 @@ jobs:
 
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/auth
+      NOTIFICATIONS_DATABASE_URL: postgresql://notifications:notifications@127.0.0.1:5432/notifications
       PORT: 3000
       JWT_ISSUER: http://localhost:3000/auth
       JWT_AUDIENCE: pixaeron-api
@@ -123,6 +124,19 @@ jobs:
             ([.[].runtimeEnvFileEnv] | length) == ([.[].runtimeEnvFileEnv] | unique | length)
           ' .github/deploy-services.json > /dev/null
 
+          jq -e '
+            [.[] | select(.project == "notifications")] as $notifications |
+            [.[] | select(.project == "auth")] as $auth |
+            ($notifications | length) == 0 or (
+              ($notifications | length) == 1 and
+              ($auth | length) == 1 and
+              ($notifications[0].deploymentOrder < $auth[0].deploymentOrder)
+            )
+          ' .github/deploy-services.json > /dev/null || {
+            echo "Notifications requires exactly one Auth service and must deploy before it." >&2
+            exit 1
+          }
+
           while IFS= read -r dockerfile; do
             [[ -f "$dockerfile" ]] || {
               echo "Dockerfile not found: $dockerfile" >&2
@@ -157,6 +171,48 @@ jobs:
             }
           done < <(jq -r '.[].composeService' .github/deploy-services.json)
 
+          if jq -e 'any(.[]; .project == "notifications")' \
+            .github/deploy-services.json > /dev/null; then
+            compose_config="$(
+              PIXAERON_CERTS_DIR="$PWD/.ci/certs" \
+              docker compose --env-file .ci/deployment.env \
+                -f docker-compose.production.yaml \
+                config --format json
+            )"
+
+            jq -e '
+              (.networks.notifications_command.internal == true) and
+              (
+                [
+                  .services
+                  | to_entries[]
+                  | select((.value.networks // {}) | has("notifications_command"))
+                  | .key
+                ]
+                | sort
+              ) == ["auth", "notifications"] and
+              (
+                [
+                  .services
+                  | to_entries[]
+                  | select((.value.networks // {}) | has("notifications_egress"))
+                  | .key
+                ]
+              ) == ["notifications"] and
+              (.networks.notifications_egress.internal != true) and
+              (.services.auth.environment.NOTIFICATIONS_GRPC_URL == "notifications-command:50052") and
+              (.services.notifications.environment.NOTIFICATIONS_GRPC_HOST == "notifications-command") and
+              (.services.notifications.networks.notifications_command.aliases == ["notifications-command"]) and
+              (.services.auth.environment.NOTIFICATIONS_GRPC_DEADLINE_MS == "2000") and
+              (.services.auth.environment.EMAIL_ACTION_RESPONSE_BUDGET_MS == "2500") and
+              ((.services.auth.environment | has("AUTH_EMAIL_RESPONSE_BUDGET_MS")) | not) and
+              ((.services.notifications.ports // []) | length == 0)
+            ' <<< "$compose_config" > /dev/null || {
+              echo "Notifications gRPC must bind only to its command-network alias; Notifications must own the only egress attachment and publish no host ports." >&2
+              exit 1
+            }
+          fi
+
       - name: Set affected base and head SHAs
         if: github.event_name != 'workflow_dispatch'
         uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5
@@ -188,11 +244,28 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Check protobuf contract compatibility
+        run: npx nx run-many -t contracts-breaking
+
+      - name: Create Notifications CI database
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker exec "$POSTGRES_CONTAINER_ID" \
+            psql --username postgres --dbname postgres --set ON_ERROR_STOP=1 \
+              --command "CREATE ROLE notifications LOGIN PASSWORD 'notifications';"
+          docker exec "$POSTGRES_CONTAINER_ID" \
+            createdb --username postgres --owner notifications notifications
+
       - name: Verify affected projects
         if: github.event_name != 'workflow_dispatch'
         run: |
           npx nx affected -t lint test build
           npx nx affected -t schema-check
+          DATABASE_URL="$NOTIFICATIONS_DATABASE_URL" npx nx affected -t db-integration
 
       - name: Run affected end-to-end tests
         if: github.event_name != 'workflow_dispatch'
@@ -217,9 +290,10 @@ jobs:
 
           npx nx run-many -t lint test build --projects="$projects"
           npx nx run-many -t schema-check --projects="$projects"
+          DATABASE_URL="$NOTIFICATIONS_DATABASE_URL" npx nx run-many -t db-integration --projects="$projects"
           npx nx run-many -t e2e
 
-      - name: Build deployable Docker images
+      - name: Build and smoke-test deployable Docker images
         if: github.event_name == 'pull_request'
         shell: bash
         run: |
@@ -229,6 +303,10 @@ jobs:
 
           while IFS=$'\t' read -r project dockerfile; do
             docker build --file "$dockerfile" --tag "pixaeron-ci:$project" .
+
+            if [[ "$project" == "notifications" ]]; then
+              bash apps/notifications/scripts/docker-smoke.sh "pixaeron-ci:$project"
+            fi
           done < <(
             jq -r --argjson affected "$affected" '
               .[] |
@@ -541,7 +619,6 @@ jobs:
     concurrency:
       group: pixaeron-production
       cancel-in-progress: false
-      queue: max
 
     permissions:
       actions: read
