@@ -108,8 +108,8 @@ mv -f "$incoming_runtime_env" "$runtime_env"
 chmod 600 "$runtime_env" "$deployment_env"
 
 upsert_env_value() {
-  key="$1"
-  value="$2"
+  local key="$1"
+  local value="$2"
 
   if grep -qE "^${key}=" "$deployment_env"; then
     sed -i "s|^${key}=.*|${key}=${value}|" "$deployment_env"
