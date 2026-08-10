@@ -96,33 +96,46 @@ jobs:
             length > 0 and
             all(.[];
               (.project | type) == "string" and
+              (.project | test("\\A[A-Za-z][A-Za-z0-9_-]{0,63}\\z")) and
               (.deploymentOrder | type) == "number" and
               (.deploymentOrder | floor) == .deploymentOrder and
               (.deploymentOrder >= 0) and
               (.imageName | type) == "string" and
+              (.imageName | length) <= 255 and
+              (.imageName | test("\\Aghcr\\.io/[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*\\z")) and
               (.dockerfile | type) == "string" and
               (.composeService | type) == "string" and
+              (.composeService | test("\\A[a-z0-9][a-z0-9_-]{0,63}\\z")) and
               (.imageTagEnv | type) == "string" and
+              (.imageTagEnv | test("\\A[A-Z_][A-Z0-9_]*\\z")) and
               (.ssmPath | type) == "string" and
-              (.ssmPath | startswith("/")) and
+              (.ssmPath | test("\\A/[A-Za-z0-9._/-]+\\z")) and
+              (.ssmPath | contains("//") | not) and
+              (.ssmPath | split("/") | index("..") | not) and
               (.ssmPath | endswith("/") | not) and
               (.secureParameters | type) == "array" and
               (.secureParameters | length) > 0 and
               all(.secureParameters[];
-                type == "string" and test("^[A-Z_][A-Z0-9_]*$")
+                type == "string" and test("\\A[A-Z_][A-Z0-9_]*\\z")
               ) and
               (.secureParameters | length) ==
               (.secureParameters | unique | length) and
               (.runtimeEnvFileEnv | type) == "string" and
-              (.migrationCommand | type) == "string"
+              (.runtimeEnvFileEnv | test("\\A[A-Z_][A-Z0-9_]*\\z")) and
+              (.migrationCommand | type) == "string" and
+              (.migrationCommand | test("[[:cntrl:]]") | not)
             ) and
             ([.[].project] | length) == ([.[].project] | unique | length) and
             ([.[].deploymentOrder] | length) == ([.[].deploymentOrder] | unique | length) and
+            ([.[].imageName] | length) == ([.[].imageName] | unique | length) and
             ([.[].composeService] | length) == ([.[].composeService] | unique | length) and
             ([.[].imageTagEnv] | length) == ([.[].imageTagEnv] | unique | length) and
             ([.[].ssmPath] | length) == ([.[].ssmPath] | unique | length) and
             ([.[].runtimeEnvFileEnv] | length) == ([.[].runtimeEnvFileEnv] | unique | length)
-          ' .github/deploy-services.json > /dev/null
+          ' .github/deploy-services.json > /dev/null || {
+            echo "Deployment manifest has an invalid field or duplicate unique value." >&2
+            exit 1
+          }
 
           jq -e '
             [.[] | select(.project == "notifications")] as $notifications |
@@ -137,8 +150,10 @@ jobs:
             exit 1
           }
 
+          repository_root="$(pwd -P)"
           while IFS= read -r dockerfile; do
-            [[ -f "$dockerfile" ]] || {
+            resolved_dockerfile="$(realpath -m -- "$dockerfile")"
+            [[ "$resolved_dockerfile" == "$repository_root/"* && -f "$resolved_dockerfile" ]] || {
               echo "Dockerfile not found: $dockerfile" >&2
               exit 1
             }
@@ -157,29 +172,23 @@ jobs:
             '.[] | .imageTagEnv + "=validation", .runtimeEnvFileEnv + "=" + $runtime_env' \
             .github/deploy-services.json > .ci/deployment.env
 
-          compose_services="$(
+          compose_config="$(
             PIXAERON_CERTS_DIR="$PWD/.ci/certs" \
             docker compose --env-file .ci/deployment.env \
               -f docker-compose.production.yaml \
-              config --services
+              config --format json
           )"
 
-          while IFS= read -r service; do
-            grep -Fxq "$service" <<< "$compose_services" || {
-              echo "Compose service not found: $service" >&2
+          while IFS=$'\t' read -r service expected_image; do
+            actual_image="$(jq -r --arg service "$service" '.services[$service].image // ""' <<< "$compose_config")"
+            [[ "$actual_image" == "$expected_image" ]] || {
+              echo "Compose service $service must use image $expected_image; found ${actual_image:-<missing>}." >&2
               exit 1
             }
-          done < <(jq -r '.[].composeService' .github/deploy-services.json)
+          done < <(jq -r '.[] | [.composeService, (.imageName + ":validation")] | @tsv' .github/deploy-services.json)
 
           if jq -e 'any(.[]; .project == "notifications")' \
             .github/deploy-services.json > /dev/null; then
-            compose_config="$(
-              PIXAERON_CERTS_DIR="$PWD/.ci/certs" \
-              docker compose --env-file .ci/deployment.env \
-                -f docker-compose.production.yaml \
-                config --format json
-            )"
-
             jq -e '
               (.networks.notifications_command.internal == true) and
               (
@@ -206,7 +215,11 @@ jobs:
               (.services.auth.environment.NOTIFICATIONS_GRPC_DEADLINE_MS == "2000") and
               (.services.auth.environment.EMAIL_ACTION_RESPONSE_BUDGET_MS == "2500") and
               ((.services.auth.environment | has("AUTH_EMAIL_RESPONSE_BUDGET_MS")) | not) and
-              ((.services.notifications.ports // []) | length == 0)
+              ((.services.notifications.ports // []) | length == 0) and
+              ((.services.auth.ports // []) | length > 0) and
+              all(.services.auth.ports[]; .host_ip == "127.0.0.1") and
+              ((.services.gateway.ports // []) | length > 0) and
+              all(.services.gateway.ports[]; .host_ip == "127.0.0.1")
             ' <<< "$compose_config" > /dev/null || {
               echo "Notifications gRPC must bind only to its command-network alias; Notifications must own the only egress attachment and publish no host ports." >&2
               exit 1
@@ -245,7 +258,19 @@ jobs:
         run: npm ci
 
       - name: Check protobuf contract compatibility
+        if: github.event_name != 'workflow_dispatch'
         run: npx nx run-many -t contracts-breaking
+
+      - name: Check manual-branch protobuf compatibility
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        env:
+          NX_BASE: origin/main
+        run: npx nx run-many -t contracts-breaking
+
+      - name: Explain manual main protobuf verification
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: echo '::notice title=Protobuf compatibility::The checked-out main commit is the compatibility baseline, so comparing it with itself would not provide a separate verification.'
 
       - name: Create Notifications CI database
         env:
@@ -288,7 +313,8 @@ jobs:
             projects="$SERVICE_INPUT"
           fi
 
-          npx nx run-many -t lint test build --projects="$projects"
+          npx nx run-many -t lint test
+          npx nx run-many -t build --projects="$projects"
           npx nx run-many -t schema-check --projects="$projects"
           DATABASE_URL="$NOTIFICATIONS_DATABASE_URL" npx nx run-many -t db-integration --projects="$projects"
           npx nx run-many -t e2e
@@ -310,6 +336,7 @@ jobs:
           done < <(
             jq -r --argjson affected "$affected" '
               .[] |
+              select(.project != "gateway") |
               select(.project as $project | ($affected | index($project))) |
               [.project, .dockerfile] | @tsv
             ' .github/deploy-services.json
@@ -453,13 +480,7 @@ jobs:
             ' .github/deploy-services.json)"
           fi
 
-          selected="$(jq -c --argjson subgraphs "$subgraphs" '
-            map(. as $deployment |
-              (($subgraphs | map(select(.project == $deployment.project)) | .[0]) // null) as $subgraph |
-              if $subgraph == null then . else . + { subgraph: $subgraph } end
-            ) |
-            sort_by(.deploymentOrder)
-          ' <<< "$selected")"
+          selected="$(jq -c 'sort_by(.deploymentOrder)' <<< "$selected")"
 
           deploy_matrix="$(jq -cn --argjson include "$selected" '{include: $include}')"
           subgraph_matrix="$(jq -cn --argjson include "$selected_subgraphs" '{include: $include}')"
@@ -646,12 +667,44 @@ jobs:
 
           current_main_sha="$(git ls-remote --exit-code origin refs/heads/main | awk 'NR == 1 { print $1 }')"
           if [[ "$current_main_sha" != "$GITHUB_SHA" ]]; then
-            echo "Skipping stale release $GITHUB_SHA; main is $current_main_sha."
+            message="Release $GITHUB_SHA was superseded by main commit $current_main_sha; no production changes were made."
+            echo "::notice title=Stale production release::$message"
+            printf '### Production deployment skipped\n\n%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
             echo 'deploy=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo 'deploy=true' >> "$GITHUB_OUTPUT"
+
+      - name: Validate production deployment configuration
+        if: steps.release_guard.outputs.deploy == 'true'
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required_names=(
+            VPS_HOST
+            VPS_USER
+            VPS_SSH_PRIVATE_KEY
+            VPS_KNOWN_HOSTS
+            AWS_DEPLOY_ROLE_ARN
+            AWS_REGION
+          )
+          missing_names=()
+
+          for name in "${required_names[@]}"; do
+            [[ -n "${!name:-}" ]] || missing_names+=("$name")
+          done
+
+          if (( ${#missing_names[@]} > 0 )); then
+            printf 'Missing production deployment configuration: %s\n' "${missing_names[*]}" >&2
+            exit 1
+          fi
 
       - name: Configure AWS credentials
         if: steps.release_guard.outputs.deploy == 'true'
@@ -678,7 +731,7 @@ jobs:
       - name: Resolve versioned deployment script
         if: steps.release_guard.outputs.deploy == 'true'
         id: deployment
-        uses: DaLVeRS2001/ci/actions/pixaeron/deploy-service@308cddd6c5a6512deeaf44678b4f5695b6bf1d13
+        uses: DaLVeRS2001/ci/actions/pixaeron/deploy-service@c31b9a9c2792ece433a853f61b7769abd287aaa8
 
       - name: Log in to GHCR on VPS
         if: steps.release_guard.outputs.deploy == 'true'
@@ -727,7 +780,7 @@ jobs:
               length > 0 and
               all(.[];
                 (.Name | startswith($prefix)) and
-                ((.Name | ltrimstr($prefix)) | test("^[A-Z_][A-Z0-9_]*$")) and
+                ((.Name | ltrimstr($prefix)) | test("\\A[A-Z_][A-Z0-9_]*\\z")) and
                 (.Value | contains("\u0000") | not) and
                 (.Value | contains("\n") | not) and
                 (.Value | contains("\r") | not)
