@@ -99,14 +99,22 @@ The `verify` job:
 1. starts isolated PostgreSQL 18 and Redis 8 service containers, then creates
    the separate Notifications database and role inside the CI PostgreSQL service;
 2. checks out the complete Pixaeron history;
-3. validates `.github/deploy-services.json`;
-4. validates `docker-compose.production.yaml`;
+3. validates `.github/deploy-services.json`, including unique deployment and
+   image identifiers, safe environment-key fields, and Dockerfiles inside the repository;
+4. renders and validates `docker-compose.production.yaml`, including the exact
+   manifest image assigned to every service;
 5. installs Node.js 24 dependencies with `npm ci`;
-6. runs every Nx `contracts-breaking` target against `NX_BASE` (or `main`
-   for a manual dispatch), then runs affected lint, test, build, e2e, GraphQL
-   schema-check, and service-owned database-integration targets;
-7. builds affected deployable Dockerfiles on pull requests; the Notifications image
-   then runs a container-level smoke test against a fresh PostgreSQL 18 database,
+6. on pull requests and pushes, checks protobuf compatibility and runs affected
+   lint, test, build, e2e, GraphQL schema, and database-integration targets. A
+   manual run checks a non-`main` branch's protobuf contract against
+   `origin/main`, runs lint, test, and e2e across the whole Nx workspace, then
+   runs build, GraphQL schema, and database-integration checks only for the
+   selected deployable projects. On `main`, it does not compare the checked-out
+   commit with itself as a contract baseline;
+7. builds affected deployable Dockerfiles on pull requests. Gateway's Nx build
+   already builds its Dockerfile, so the separate smoke loop does not build it a
+   second time. The Notifications image runs a container-level smoke test against
+   a fresh PostgreSQL 18 database,
    exercises the real gRPC wire contract on the private command network, proves
    that the command alias is unreachable from the egress network, and verifies
    that a failed database bootstrap terminates the process;
@@ -123,11 +131,14 @@ successful verification, outside pull requests, for `refs/heads/main`:
 
 1. `build-images` builds every selected service in a matrix and pushes only the
    immutable `sha-<pixaeron-commit>` tag to GHCR. Production CI neither
-   publishes nor deploys a mutable `latest` tag.
+   publishes nor deploys a mutable `latest` tag. Missing image-tag variables
+   resolve to the deliberately nonexistent `sha-not-configured` fallback, so a
+   manual production Compose run fails closed instead of pulling an unrelated image.
 2. One `deploy-release` job starts only after the complete image matrix
    succeeds. It enters the caller's protected `production` environment,
-   obtains temporary AWS credentials through GitHub OIDC, validates every
-   manifest service's Parameter Store hierarchy before changing a container,
+   validates the required production configuration, obtains temporary AWS
+   credentials through GitHub OIDC, and validates every manifest service's
+   Parameter Store hierarchy before changing a container,
    stages all mode-0600 runtime env files, and then deploys only the selected
    services sequentially. After every remote health check succeeds, the same
    job publishes each affected subgraph SDL from the deployed commit with
@@ -151,8 +162,9 @@ same ordered release without another copied deploy job.
 `deploy-release` owns the single non-cancelling `pixaeron-production`
 concurrency queue for both deployment and GraphOS publication. Once it acquires
 the queue, its stale-main guard compares the workflow commit with the current
-remote `main`; an older queued run exits without changing production. A manual
-release of a GraphQL subgraph or Gateway must use `service=all`, because either
+remote `main`; an older queued run exits without changing production and writes
+an explicit notice and job summary. A manual release of a GraphQL subgraph or
+Gateway must use `service=all`, because either
 partial release could leave the static Gateway supergraph out of sync. Manual
 releases of unrelated non-subgraph services may remain service-specific.
 
@@ -423,8 +435,6 @@ script used by an already-reviewed Pixaeron workflow.
 `Validate CI repository` runs on pull requests and pushes to `main`. It:
 
 - lints workflow files with pinned actionlint 1.7.12;
-- ignores only its known false positive for GitHub's newer official
-  `concurrency.queue` key;
 - runs `bash -n` against the Pixaeron deployment script;
 - invokes the composite action locally;
 - verifies that the action returns an existing script path.
