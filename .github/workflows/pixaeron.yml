@@ -86,145 +86,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve pipeline scripts
+        id: pipeline_scripts
+        uses: DaLVeRS2001/ci/actions/pixaeron/scripts@0f54b3d3068b46a4026d211963a8147077b4f43f
+
       - name: Validate deployment manifest
+        env:
+          PIPELINE_SCRIPTS: ${{ steps.pipeline_scripts.outputs.scripts_dir }}
         shell: bash
-        run: |
-          set -euo pipefail
-
-          jq -e '
-            type == "array" and
-            length > 0 and
-            all(.[];
-              (.project | type) == "string" and
-              (.project | test("\\A[A-Za-z][A-Za-z0-9_-]{0,63}\\z")) and
-              (.deploymentOrder | type) == "number" and
-              (.deploymentOrder | floor) == .deploymentOrder and
-              (.deploymentOrder >= 0) and
-              (.imageName | type) == "string" and
-              (.imageName | length) <= 255 and
-              (.imageName | test("\\Aghcr\\.io/[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*\\z")) and
-              (.dockerfile | type) == "string" and
-              (.composeService | type) == "string" and
-              (.composeService | test("\\A[a-z0-9][a-z0-9_-]{0,63}\\z")) and
-              (.imageTagEnv | type) == "string" and
-              (.imageTagEnv | test("\\A[A-Z_][A-Z0-9_]*\\z")) and
-              (.ssmPath | type) == "string" and
-              (.ssmPath | test("\\A/[A-Za-z0-9._/-]+\\z")) and
-              (.ssmPath | contains("//") | not) and
-              (.ssmPath | split("/") | index("..") | not) and
-              (.ssmPath | endswith("/") | not) and
-              (.secureParameters | type) == "array" and
-              (.secureParameters | length) > 0 and
-              all(.secureParameters[];
-                type == "string" and test("\\A[A-Z_][A-Z0-9_]*\\z")
-              ) and
-              (.secureParameters | length) ==
-              (.secureParameters | unique | length) and
-              (.runtimeEnvFileEnv | type) == "string" and
-              (.runtimeEnvFileEnv | test("\\A[A-Z_][A-Z0-9_]*\\z")) and
-              (.migrationCommand | type) == "string" and
-              (.migrationCommand | test("[[:cntrl:]]") | not)
-            ) and
-            ([.[].project] | length) == ([.[].project] | unique | length) and
-            ([.[].deploymentOrder] | length) == ([.[].deploymentOrder] | unique | length) and
-            ([.[].imageName] | length) == ([.[].imageName] | unique | length) and
-            ([.[].composeService] | length) == ([.[].composeService] | unique | length) and
-            ([.[].imageTagEnv] | length) == ([.[].imageTagEnv] | unique | length) and
-            ([.[].ssmPath] | length) == ([.[].ssmPath] | unique | length) and
-            ([.[].runtimeEnvFileEnv] | length) == ([.[].runtimeEnvFileEnv] | unique | length)
-          ' .github/deploy-services.json > /dev/null || {
-            echo "Deployment manifest has an invalid field or duplicate unique value." >&2
-            exit 1
-          }
-
-          jq -e '
-            [.[] | select(.project == "notifications")] as $notifications |
-            [.[] | select(.project == "auth")] as $auth |
-            ($notifications | length) == 0 or (
-              ($notifications | length) == 1 and
-              ($auth | length) == 1 and
-              ($notifications[0].deploymentOrder < $auth[0].deploymentOrder)
-            )
-          ' .github/deploy-services.json > /dev/null || {
-            echo "Notifications requires exactly one Auth service and must deploy before it." >&2
-            exit 1
-          }
-
-          repository_root="$(pwd -P)"
-          while IFS= read -r dockerfile; do
-            resolved_dockerfile="$(realpath -m -- "$dockerfile")"
-            [[ "$resolved_dockerfile" == "$repository_root/"* && -f "$resolved_dockerfile" ]] || {
-              echo "Dockerfile not found: $dockerfile" >&2
-              exit 1
-            }
-          done < <(jq -r '.[].dockerfile' .github/deploy-services.json)
+        run: bash "$PIPELINE_SCRIPTS/validate-manifest.sh"
 
       - name: Validate Compose configuration
+        env:
+          PIPELINE_SCRIPTS: ${{ steps.pipeline_scripts.outputs.scripts_dir }}
         shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p .ci/certs
-          : > .ci/runtime.env
-          : > .ci/certs/global-bundle.pem
-
-          jq -r --arg runtime_env "$PWD/.ci/runtime.env" \
-            '.[] | .imageTagEnv + "=validation", .runtimeEnvFileEnv + "=" + $runtime_env' \
-            .github/deploy-services.json > .ci/deployment.env
-
-          compose_config="$(
-            PIXAERON_CERTS_DIR="$PWD/.ci/certs" \
-            docker compose --env-file .ci/deployment.env \
-              -f docker-compose.production.yaml \
-              config --format json
-          )"
-
-          while IFS=$'\t' read -r service expected_image; do
-            actual_image="$(jq -r --arg service "$service" '.services[$service].image // ""' <<< "$compose_config")"
-            [[ "$actual_image" == "$expected_image" ]] || {
-              echo "Compose service $service must use image $expected_image; found ${actual_image:-<missing>}." >&2
-              exit 1
-            }
-          done < <(jq -r '.[] | [.composeService, (.imageName + ":validation")] | @tsv' .github/deploy-services.json)
-
-          if jq -e 'any(.[]; .project == "notifications")' \
-            .github/deploy-services.json > /dev/null; then
-            jq -e '
-              (.networks.notifications_command.internal == true) and
-              (
-                [
-                  .services
-                  | to_entries[]
-                  | select((.value.networks // {}) | has("notifications_command"))
-                  | .key
-                ]
-                | sort
-              ) == ["auth", "notifications"] and
-              (
-                [
-                  .services
-                  | to_entries[]
-                  | select((.value.networks // {}) | has("notifications_egress"))
-                  | .key
-                ]
-              ) == ["notifications"] and
-              (.networks.notifications_egress.internal != true) and
-              (.services.auth.environment.NOTIFICATIONS_GRPC_URL == "notifications-command:50052") and
-              (.services.notifications.environment.NOTIFICATIONS_GRPC_HOST == "notifications-command") and
-              (.services.notifications.networks.notifications_command.aliases == ["notifications-command"]) and
-              (.services.auth.environment.NOTIFICATIONS_GRPC_DEADLINE_MS == "2000") and
-              (.services.auth.environment.EMAIL_ACTION_RESPONSE_BUDGET_MS == "2500") and
-              ((.services.auth.environment | has("AUTH_EMAIL_RESPONSE_BUDGET_MS")) | not) and
-              ((.services.notifications.ports // []) | length == 0) and
-              ((.services.auth.ports // []) | length > 0) and
-              all(.services.auth.ports[]; .host_ip == "127.0.0.1") and
-              ((.services.gateway.ports // []) | length > 0) and
-              all(.services.gateway.ports[]; .host_ip == "127.0.0.1")
-            ' <<< "$compose_config" > /dev/null || {
-              echo "Notifications gRPC must bind only to its command-network alias; Notifications must own the only egress attachment and publish no host ports." >&2
-              exit 1
-            }
-          fi
+        run: bash "$PIPELINE_SCRIPTS/validate-compose.sh"
 
       - name: Set affected base and head SHAs
         if: github.event_name != 'workflow_dispatch'
@@ -345,167 +221,11 @@ jobs:
       - name: Build deployment matrix
         id: deploy_matrix
         env:
+          PIPELINE_SCRIPTS: ${{ steps.pipeline_scripts.outputs.scripts_dir }}
           SERVICE_INPUT: ${{ inputs.service || 'all' }}
           TRUSTED_GRAPHOS_RUN: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
         shell: bash
-        run: |
-          set -euo pipefail
-
-          workspace_projects="$(npx nx show projects --json)"
-          jq -e --argjson workspace_projects "$workspace_projects" '
-            all(.[];
-              .project as $project |
-              ($workspace_projects | index($project)) != null
-            )
-          ' .github/deploy-services.json > /dev/null || {
-            echo 'Deployment manifest contains an unknown Nx project.' >&2
-            exit 1
-          }
-
-          if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
-            affected="$(npx nx show projects --affected --json)"
-          fi
-
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            selected='[]'
-          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ "$SERVICE_INPUT" == "all" ]]; then
-              selected="$(jq -c '.' .github/deploy-services.json)"
-            else
-              selected="$(jq -c --arg project "$SERVICE_INPUT" \
-                '[.[] | select(.project == $project)]' \
-                .github/deploy-services.json)"
-            fi
-          else
-            selected="$(jq -c --argjson affected "$affected" \
-              '[.[] | select(.project as $project | ($affected | index($project)))]' \
-              .github/deploy-services.json)"
-          fi
-
-          subgraph_projects="$(npx nx show projects --type app --withTarget schema-check --json)"
-          subgraphs='[]'
-
-          while IFS= read -r project; do
-            [[ "$project" =~ ^[A-Za-z][A-Za-z0-9_-]{0,63}$ ]] || {
-              echo "Nx project name is not a valid GraphOS subgraph name: $project" >&2
-              exit 1
-            }
-
-            project_config="$(npx nx show project "$project" --json)"
-            jq -e '.targets["schema-export"] != null' <<< "$project_config" > /dev/null || {
-              echo "GraphQL subgraph project is missing the schema-export target: $project" >&2
-              exit 1
-            }
-
-            project_root="$(jq -r '.root // empty' <<< "$project_config")"
-            [[ -n "$project_root" ]] || {
-              echo "Nx project has no root: $project" >&2
-              exit 1
-            }
-
-            schema="$project_root/schema.graphql"
-            [[ -f "$schema" ]] || {
-              echo "GraphQL subgraph schema not found: $schema" >&2
-              exit 1
-            }
-            git ls-files --error-unmatch "$schema" > /dev/null || {
-              echo "GraphQL subgraph schema must be committed: $schema" >&2
-              exit 1
-            }
-
-            subgraphs="$(
-              jq -c \
-                --arg project "$project" \
-                --arg name "$project" \
-                --arg schema "$schema" \
-                '. + [{ project: $project, name: $name, schema: $schema }]' \
-                <<< "$subgraphs"
-            )"
-          done < <(jq -r '.[]' <<< "$subgraph_projects")
-
-          gateway_count="$(jq '[.[] | select(.project == "gateway")] | length' .github/deploy-services.json)"
-          [[ "$gateway_count" == "1" ]] || {
-            echo 'Deployment manifest must contain exactly one Gateway row.' >&2
-            exit 1
-          }
-          gateway_order="$(jq -r '.[] | select(.project == "gateway") | .deploymentOrder' .github/deploy-services.json)"
-
-          while IFS= read -r project; do
-            deployment_count="$(
-              jq --arg project "$project" '[.[] | select(.project == $project)] | length' .github/deploy-services.json
-            )"
-            [[ "$deployment_count" == "1" ]] || {
-              echo "GraphQL subgraph must have exactly one deployment manifest row: $project" >&2
-              exit 1
-            }
-
-            deployment_order="$(
-              jq -r --arg project "$project" '.[] | select(.project == $project) | .deploymentOrder' .github/deploy-services.json
-            )"
-            (( deployment_order < gateway_order )) || {
-              echo "GraphQL subgraph $project must deploy before Gateway." >&2
-              exit 1
-            }
-          done < <(jq -r '.[].project' <<< "$subgraphs")
-
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ "$SERVICE_INPUT" == "all" ]]; then
-              selected_subgraphs="$subgraphs"
-            else
-              selected_subgraphs="$(jq -c --arg project "$SERVICE_INPUT" '[.[] | select(.project == $project)]' <<< "$subgraphs")"
-            fi
-          else
-            selected_subgraphs="$(jq -c --argjson affected "$affected" '[.[] | select(.project as $project | ($affected | index($project)))]' <<< "$subgraphs")"
-          fi
-
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$SERVICE_INPUT" != "all" ]]; then
-            if [[ "$SERVICE_INPUT" == "gateway" ]] ||
-              jq -e 'length > 0' <<< "$selected_subgraphs" > /dev/null; then
-              echo 'A subgraph or Gateway release must use service=all so the static supergraph stays aligned.' >&2
-              exit 1
-            fi
-          fi
-
-          if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]] &&
-            jq -e 'length > 1' <<< "$selected_subgraphs" > /dev/null; then
-            echo 'Multi-subgraph releases require one batch GraphOS publishSubgraphs operation.' >&2
-            exit 1
-          fi
-
-          if [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]] &&
-            jq -e 'length > 0' <<< "$selected_subgraphs" > /dev/null; then
-            selected="$(jq -c --argjson selected "$selected" '
-              ($selected | map(.project) + ["gateway"] | unique) as $projects |
-              [.[] | select(.project as $project | $projects | index($project))]
-            ' .github/deploy-services.json)"
-          fi
-
-          selected="$(jq -c 'sort_by(.deploymentOrder)' <<< "$selected")"
-
-          {
-            echo '### Deployment selection'
-            echo
-            echo "- event \`$GITHUB_EVENT_NAME\` on \`$GITHUB_REF\`, service input \`$SERVICE_INPUT\`"
-            echo "- services: \`$(jq -c 'map(.project)' <<< "$selected")\`"
-            echo "- subgraphs: \`$(jq -c 'map(.project)' <<< "$selected_subgraphs")\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          deploy_matrix="$(jq -cn --argjson include "$selected" '{include: $include}')"
-          subgraph_matrix="$(jq -cn --argjson include "$selected_subgraphs" '{include: $include}')"
-          echo "matrix=$deploy_matrix" >> "$GITHUB_OUTPUT"
-          echo "subgraph_matrix=$subgraph_matrix" >> "$GITHUB_OUTPUT"
-
-          if jq -e 'length > 0' <<< "$selected" > /dev/null; then
-            echo "has_deployments=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_deployments=false" >> "$GITHUB_OUTPUT"
-          fi
-
-          if jq -e 'length > 0' <<< "$selected_subgraphs" > /dev/null && [[ "$TRUSTED_GRAPHOS_RUN" == "true" ]]; then
-            echo "graphos_check_required=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "graphos_check_required=false" >> "$GITHUB_OUTPUT"
-          fi
+        run: bash "$PIPELINE_SCRIPTS/build-deploy-matrix.sh"
 
   graphos-check:
     name: Check ${{ matrix.name }} schema in GraphOS
@@ -672,6 +392,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve pipeline scripts
+        id: pipeline_scripts
+        uses: DaLVeRS2001/ci/actions/pixaeron/scripts@0f54b3d3068b46a4026d211963a8147077b4f43f
+
       - name: Reject stale production release
         id: release_guard
         shell: bash
@@ -758,157 +482,18 @@ jobs:
             "docker login ghcr.io -u '${{ github.actor }}' --password-stdin"
       - name: Prepare runtime environments
         if: steps.release_guard.outputs.deploy == 'true'
+        env:
+          PIPELINE_SCRIPTS: ${{ steps.pipeline_scripts.outputs.scripts_dir }}
         shell: bash
-        run: |
-          set -euo pipefail
-
-          runtime_dir="$RUNNER_TEMP/pixaeron-runtime"
-          install -m 700 -d "$runtime_dir"
-          umask 077
-
-          prepare_runtime_env() {
-            local deployment="$1"
-            local project compose_service ssm_path secure_parameters
-            local parameters prefix key parameter_type service_env
-            local name encoded_value value
-
-            project="$(jq -r '.project' <<< "$deployment")"
-            compose_service="$(jq -r '.composeService' <<< "$deployment")"
-            ssm_path="$(jq -r '.ssmPath' <<< "$deployment")"
-            secure_parameters="$(jq -c '.secureParameters' <<< "$deployment")"
-
-            echo "Validating runtime configuration for $project."
-
-            parameters="$(
-              aws ssm get-parameters-by-path \
-                --path "$ssm_path" \
-                --recursive \
-                --with-decryption \
-                --query 'Parameters' \
-                --output json
-            )"
-
-            prefix="$ssm_path/"
-            jq -e --arg prefix "$prefix" '
-              length > 0 and
-              all(.[];
-                (.Name | startswith($prefix)) and
-                ((.Name | ltrimstr($prefix)) | test("\\A[A-Z_][A-Z0-9_]*\\z")) and
-                (.Value | contains("\u0000") | not) and
-                (.Value | contains("\n") | not) and
-                (.Value | contains("\r") | not)
-              ) and
-              ([.[] | .Name | ltrimstr($prefix)] | length) ==
-              ([.[] | .Name | ltrimstr($prefix)] | unique | length)
-            ' <<< "$parameters" > /dev/null || {
-              echo "No valid, unique environment parameters found under $ssm_path." >&2
-              exit 1
-            }
-
-            while IFS= read -r key; do
-              parameter_type="$(
-                jq -r --arg name "$prefix$key" '
-                  first(.[] | select(.Name == $name) | .Type) // ""
-                ' <<< "$parameters"
-              )"
-
-              if [[ "$parameter_type" != 'SecureString' ]]; then
-                echo "$prefix$key must exist and use the SecureString type." >&2
-                exit 1
-              fi
-            done < <(jq -r '.[]' <<< "$secure_parameters")
-
-            service_env="$runtime_dir/$compose_service.env"
-            : > "$service_env"
-
-            while IFS=$'\t' read -r name encoded_value; do
-              key="${name#"$prefix"}"
-              value="$(printf '%s' "$encoded_value" | base64 --decode)"
-              printf '%s=%s\n' "$key" "$value" >> "$service_env"
-            done < <(
-              jq -r 'sort_by(.Name)[] | [.Name, (.Value | @base64)] | @tsv' \
-                <<< "$parameters"
-            )
-          }
-
-          while IFS= read -r deployment; do
-            prepare_runtime_env "$deployment"
-          done < <(jq -c '.[]' .github/deploy-services.json)
-
-          ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
-            'install -d -m 755 /opt/pixaeron'
-
-          while IFS= read -r deployment; do
-            project="$(jq -r '.project' <<< "$deployment")"
-            compose_service="$(jq -r '.composeService' <<< "$deployment")"
-            service_env="$runtime_dir/$compose_service.env"
-            staged_env="/opt/pixaeron/$compose_service.env.next"
-            live_env="/opt/pixaeron/$compose_service.env"
-
-            scp -p -o BatchMode=yes "$service_env" \
-              "$VPS_USER@$VPS_HOST:$staged_env"
-
-            printf -v bootstrap_command \
-              'if [ ! -f %q ]; then install -m 600 -- %q %q; fi' \
-              "$live_env" "$staged_env" "$live_env"
-            ssh -n -o BatchMode=yes "$VPS_USER@$VPS_HOST" "$bootstrap_command"
-
-            echo "Runtime configuration for $project is ready."
-          done < <(jq -c '.[]' .github/deploy-services.json)
+        run: bash "$PIPELINE_SCRIPTS/prepare-runtime-envs.sh"
 
       - name: Deploy services in manifest order
         if: steps.release_guard.outputs.deploy == 'true'
         env:
+          PIPELINE_SCRIPTS: ${{ steps.pipeline_scripts.outputs.scripts_dir }}
           DEPLOYMENT_SCRIPT: ${{ steps.deployment.outputs.script_path }}
         shell: bash
-        run: |
-          set -euo pipefail
-
-          runtime_dir="$RUNNER_TEMP/pixaeron-runtime"
-          [[ -d "$runtime_dir" ]] || {
-            echo 'Prepared runtime environment directory is missing.' >&2
-            exit 1
-          }
-
-          scp -o BatchMode=yes "$DEPLOYMENT_SCRIPT" \
-            "$VPS_USER@$VPS_HOST:/opt/pixaeron/deploy-service.sh"
-
-          scp -o BatchMode=yes docker-compose.production.yaml \
-            "$VPS_USER@$VPS_HOST:/opt/pixaeron/docker-compose.production.yaml.next"
-
-          ssh -n -o BatchMode=yes "$VPS_USER@$VPS_HOST" '
-            set -eu
-            cd /opt/pixaeron
-            rm -f docker-compose.production.yaml.release-rollback
-            if [ -f docker-compose.production.yaml ]; then
-              cp -p docker-compose.production.yaml docker-compose.production.yaml.release-rollback
-            fi
-            mv -f docker-compose.production.yaml.next docker-compose.production.yaml
-          '
-
-          while IFS= read -r deployment; do
-            project="$(jq -r '.project' <<< "$deployment")"
-            deployment_order="$(jq -r '.deploymentOrder' <<< "$deployment")"
-            compose_service="$(jq -r '.composeService' <<< "$deployment")"
-            image_tag_env="$(jq -r '.imageTagEnv' <<< "$deployment")"
-            migration_command="$(jq -r '.migrationCommand' <<< "$deployment")"
-            runtime_env_file_env="$(jq -r '.runtimeEnvFileEnv' <<< "$deployment")"
-
-            echo "Deploying $project as release step $deployment_order."
-
-            printf -v remote_command '%q ' \
-              bash /opt/pixaeron/deploy-service.sh \
-              "$compose_service" \
-              "$image_tag_env" \
-              "$IMAGE_TAG" \
-              "$runtime_env_file_env" \
-              "$migration_command"
-
-            if ! ssh -n -o BatchMode=yes "$VPS_USER@$VPS_HOST" "$remote_command"; then
-              echo "::error title=Deployment failed::$project failed during release step $deployment_order. Review the SSH or deployment error above."
-              exit 1
-            fi
-          done < <(jq -c '.include[]' <<< "$DEPLOYMENTS")
+        run: bash "$PIPELINE_SCRIPTS/deploy-ordered.sh"
 
       - name: Restore the pre-release Compose file
         if: ${{ failure() && steps.release_guard.outputs.deploy == 'true' }}
