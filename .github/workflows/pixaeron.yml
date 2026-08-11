@@ -744,7 +744,7 @@ jobs:
       - name: Resolve versioned deployment script
         if: steps.release_guard.outputs.deploy == 'true'
         id: deployment
-        uses: DaLVeRS2001/ci/actions/pixaeron/deploy-service@c31b9a9c2792ece433a853f61b7769abd287aaa8
+        uses: DaLVeRS2001/ci/actions/pixaeron/deploy-service@1b61868aef23e961a4c8d65b2d8e376ac291b374
 
       - name: Log in to GHCR on VPS
         if: steps.release_guard.outputs.deploy == 'true'
@@ -873,6 +873,19 @@ jobs:
           scp -o BatchMode=yes "$DEPLOYMENT_SCRIPT" \
             "$VPS_USER@$VPS_HOST:/opt/pixaeron/deploy-service.sh"
 
+          scp -o BatchMode=yes docker-compose.production.yaml \
+            "$VPS_USER@$VPS_HOST:/opt/pixaeron/docker-compose.production.yaml.next"
+
+          ssh -n -o BatchMode=yes "$VPS_USER@$VPS_HOST" '
+            set -eu
+            cd /opt/pixaeron
+            rm -f docker-compose.production.yaml.release-rollback
+            if [ -f docker-compose.production.yaml ]; then
+              cp -p docker-compose.production.yaml docker-compose.production.yaml.release-rollback
+            fi
+            mv -f docker-compose.production.yaml.next docker-compose.production.yaml
+          '
+
           while IFS= read -r deployment; do
             project="$(jq -r '.project' <<< "$deployment")"
             deployment_order="$(jq -r '.deploymentOrder' <<< "$deployment")"
@@ -882,9 +895,6 @@ jobs:
             runtime_env_file_env="$(jq -r '.runtimeEnvFileEnv' <<< "$deployment")"
 
             echo "Deploying $project as release step $deployment_order."
-
-            scp -o BatchMode=yes docker-compose.production.yaml \
-              "$VPS_USER@$VPS_HOST:/opt/pixaeron/docker-compose.production.yaml.next"
 
             printf -v remote_command '%q ' \
               bash /opt/pixaeron/deploy-service.sh \
@@ -899,6 +909,35 @@ jobs:
               exit 1
             fi
           done < <(jq -c '.include[]' <<< "$DEPLOYMENTS")
+
+      - name: Restore the pre-release Compose file
+        if: ${{ failure() && steps.release_guard.outputs.deploy == 'true' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          if ! ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$VPS_USER@$VPS_HOST" '
+            cd /opt/pixaeron || exit 0
+            if [ -f docker-compose.production.yaml.release-rollback ]; then
+              mv -f docker-compose.production.yaml.release-rollback docker-compose.production.yaml
+              echo "Restored the pre-release Compose file."
+            else
+              echo "No pre-release Compose baseline to restore."
+            fi
+          '; then
+            echo "::error title=Compose restore failed::The pre-release Compose file may still be replaced on the VPS. Restore /opt/pixaeron/docker-compose.production.yaml.release-rollback by hand."
+          fi
+
+      - name: Discard the release Compose baseline
+        if: ${{ success() && steps.release_guard.outputs.deploy == 'true' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          if ! ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$VPS_USER@$VPS_HOST" \
+            'rm -f -- /opt/pixaeron/docker-compose.production.yaml.release-rollback'; then
+            echo "::warning title=Baseline cleanup failed::Could not remove the release Compose baseline."
+          fi
 
       - name: Clean up staged runtime environments
         if: ${{ always() && steps.release_guard.outputs.deploy == 'true' }}
@@ -918,6 +957,11 @@ jobs:
               echo "::warning title=Staging cleanup failed::Could not remove the staged $compose_service runtime environment."
             fi
           done < <(jq -r '.[].composeService' .github/deploy-services.json)
+
+          if ! ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$VPS_USER@$VPS_HOST" \
+            'rm -f -- /opt/pixaeron/docker-compose.production.yaml.next'; then
+            echo '::warning title=Staging cleanup failed::Could not remove the staged Compose file.'
+          fi
 
       - name: Publish deployed subgraph schemas
         if: >-
