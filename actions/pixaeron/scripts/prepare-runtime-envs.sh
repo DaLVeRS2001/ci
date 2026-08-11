@@ -60,12 +60,15 @@ prepare_runtime_env() {
   service_env="$runtime_dir/$compose_service.env"
   : > "$service_env"
 
-  while IFS=$'\t' read -r name encoded_value; do
+  while IFS=$'\t' read -r name parameter_type encoded_value; do
     key="${name#"$prefix"}"
     value="$(printf '%s' "$encoded_value" | base64 --decode)"
+    if [[ "$parameter_type" == 'SecureString' ]]; then
+      echo "::add-mask::$value"
+    fi
     printf '%s=%s\n' "$key" "$value" >> "$service_env"
   done < <(
-    jq -r 'sort_by(.Name)[] | [.Name, (.Value | @base64)] | @tsv' \
+    jq -r 'sort_by(.Name)[] | [.Name, .Type, (.Value | @base64)] | @tsv' \
       <<< "$parameters"
   )
 }
