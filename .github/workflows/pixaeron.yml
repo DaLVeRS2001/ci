@@ -985,13 +985,13 @@ jobs:
 
           if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
             echo "::warning title=Verification-only dispatch::A manual run on $GITHUB_REF verifies only. Images and the production release run exclusively on refs/heads/main."
-            printf '### No deployment\n\nRelease jobs run only on `refs/heads/main`. This run verified `%s` and stopped.\n' \
+            printf '### No deployment\n\nRelease jobs run only on refs/heads/main. This run verified "%s" and stopped.\n' \
               "$SERVICE_INPUT" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           if [[ "$DEPLOY_RESULT" == 'success' && "$RELEASED" == 'true' ]]; then
-            printf '### Release executed\n\nService input `%s` was released from `%s`.\n' \
+            printf '### Release executed\n\nService input "%s" was released from commit %s.\n' \
               "$SERVICE_INPUT" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
