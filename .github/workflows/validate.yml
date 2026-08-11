@@ -25,16 +25,44 @@ jobs:
           cache: false
           pyflakes: false
 
-      - name: Validate deployment script syntax
+      - name: Validate action script syntax
         shell: bash
-        run: bash -n actions/pixaeron/deploy-service/deploy-service.sh
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r script; do
+            bash -n "$script"
+          done < <(find actions -name '*.sh' -type f)
+
+      - name: Lint action scripts with shellcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find actions -name '*.sh' -type f -print0 | xargs -0 shellcheck
 
       - name: Resolve deployment script through the action
         id: deployment
         uses: ./actions/pixaeron/deploy-service
 
-      - name: Verify action output
+      - name: Verify deployment action output
         env:
           DEPLOYMENT_SCRIPT: ${{ steps.deployment.outputs.script_path }}
         shell: bash
         run: test -f "$DEPLOYMENT_SCRIPT"
+
+      - name: Resolve pipeline scripts through the action
+        id: pipeline_scripts
+        uses: ./actions/pixaeron/scripts
+
+      - name: Verify pipeline scripts output
+        env:
+          PIPELINE_SCRIPTS: ${{ steps.pipeline_scripts.outputs.scripts_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for script in validate-manifest validate-compose build-deploy-matrix \
+            prepare-runtime-envs deploy-ordered; do
+            test -f "$PIPELINE_SCRIPTS/$script.sh"
+          done

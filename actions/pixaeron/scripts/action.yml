@@ -1,0 +1,23 @@
+name: Pixaeron pipeline scripts
+description: Exposes the versioned Pixaeron pipeline scripts to a workflow job.
+
+outputs:
+  scripts_dir:
+    description: Absolute path to the pipeline scripts directory on the runner.
+    value: ${{ steps.locate.outputs.scripts_dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Locate pipeline scripts
+      id: locate
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        [[ -d "$GITHUB_ACTION_PATH" ]] || {
+          echo "Pipeline scripts directory not found: $GITHUB_ACTION_PATH" >&2
+          exit 1
+        }
+
+        echo "scripts_dir=$GITHUB_ACTION_PATH" >> "$GITHUB_OUTPUT"
