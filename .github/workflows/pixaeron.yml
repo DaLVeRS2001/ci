@@ -482,6 +482,14 @@ jobs:
 
           selected="$(jq -c 'sort_by(.deploymentOrder)' <<< "$selected")"
 
+          {
+            echo '### Deployment selection'
+            echo
+            echo "- event \`$GITHUB_EVENT_NAME\` on \`$GITHUB_REF\`, service input \`$SERVICE_INPUT\`"
+            echo "- services: \`$(jq -c 'map(.project)' <<< "$selected")\`"
+            echo "- subgraphs: \`$(jq -c 'map(.project)' <<< "$selected_subgraphs")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
           deploy_matrix="$(jq -cn --argjson include "$selected" '{include: $include}')"
           subgraph_matrix="$(jq -cn --argjson include "$selected_subgraphs" '{include: $include}')"
           echo "matrix=$deploy_matrix" >> "$GITHUB_OUTPUT"
@@ -640,6 +648,9 @@ jobs:
     concurrency:
       group: pixaeron-production
       cancel-in-progress: false
+
+    outputs:
+      released: ${{ steps.release_guard.outputs.deploy }}
 
     permissions:
       actions: read
@@ -941,3 +952,49 @@ jobs:
               --check \
               --skip-update-check
           done < <(jq -c '.include[]' <<< "$SUBGRAPHS")
+
+  release-outcome:
+    name: Report manual release outcome
+    needs:
+      - verify
+      - build-images
+      - deploy-release
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Require an executed release
+        env:
+          SERVICE_INPUT: ${{ inputs.service || 'all' }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          HAS_DEPLOYMENTS: ${{ needs.verify.outputs.has_deployments }}
+          BUILD_RESULT: ${{ needs.build-images.result }}
+          DEPLOY_RESULT: ${{ needs.deploy-release.result }}
+          RELEASED: ${{ needs.deploy-release.outputs.released }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$VERIFY_RESULT" != 'success' ]]; then
+            echo "Verification finished as $VERIFY_RESULT; the verification gate already reports it."
+            exit 0
+          fi
+
+          if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
+            echo "::warning title=Verification-only dispatch::A manual run on $GITHUB_REF verifies only. Images and the production release run exclusively on refs/heads/main."
+            printf '### No deployment\n\nRelease jobs run only on `refs/heads/main`. This run verified `%s` and stopped.\n' \
+              "$SERVICE_INPUT" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ "$DEPLOY_RESULT" == 'success' && "$RELEASED" == 'true' ]]; then
+            printf '### Release executed\n\nService input `%s` was released from `%s`.\n' \
+              "$SERVICE_INPUT" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "::error title=Manual release deployed nothing::service='$SERVICE_INPUT' has_deployments='$HAS_DEPLOYMENTS' build-images='$BUILD_RESULT' deploy-release='$DEPLOY_RESULT' released='${RELEASED:-<unset>}'. An explicit release dispatch on main that changes nothing is a contradiction." >&2
+          exit 1
