@@ -18,26 +18,18 @@ compose_file="$deployment_dir/docker-compose.production.yaml"
 deployment_env="$deployment_dir/deployment.env"
 runtime_env="$deployment_dir/${compose_service}.env"
 
-incoming_compose="${compose_file}.next"
 incoming_runtime_env="${runtime_env}.next"
-compose_backup="${compose_file}.rollback"
 deployment_env_backup="${deployment_env}.rollback"
 runtime_env_backup="${runtime_env}.rollback"
 
-[[ -f "$incoming_compose" ]] || { echo "Missing $incoming_compose" >&2; exit 1; }
+[[ -f "$compose_file" ]] || { echo "Missing $compose_file" >&2; exit 1; }
 [[ -f "$incoming_runtime_env" ]] || { echo "Missing $incoming_runtime_env" >&2; exit 1; }
 
 cd "$deployment_dir"
 
-had_compose=false
 had_deployment_env=false
 had_runtime_env=false
 had_previous_image=false
-
-if [[ -f "$compose_file" ]]; then
-  cp -p "$compose_file" "$compose_backup"
-  had_compose=true
-fi
 
 if [[ -f "$deployment_env" ]]; then
   cp -p "$deployment_env" "$deployment_env_backup"
@@ -71,12 +63,6 @@ rollback() {
       rm --stop --force "$compose_service"
   fi
 
-  if $had_compose; then
-    mv -f "$compose_backup" "$compose_file"
-  else
-    rm -f "$compose_file"
-  fi
-
   if $had_deployment_env; then
     mv -f "$deployment_env_backup" "$deployment_env"
   else
@@ -89,12 +75,12 @@ rollback() {
     rm -f "$runtime_env"
   fi
 
-  if $had_compose && $had_deployment_env && $had_previous_image; then
+  if $had_deployment_env && $had_previous_image; then
     docker compose --env-file "$deployment_env" -f "$compose_file" \
-      up -d --wait --wait-timeout 90 "$compose_service"
+      up -d --wait --wait-timeout 90 --no-deps "$compose_service"
   fi
 
-  rm -f "$incoming_compose" "$incoming_runtime_env"
+  rm -f "$incoming_runtime_env"
   exit "$exit_code"
 }
 
@@ -103,7 +89,6 @@ rollback() {
 trap rollback ERR
 
 deployment_phase='installing deployment files'
-mv -f "$incoming_compose" "$compose_file"
 mv -f "$incoming_runtime_env" "$runtime_env"
 chmod 600 "$runtime_env" "$deployment_env"
 
@@ -151,4 +136,4 @@ if ! docker image prune -af \
   echo "Could not prune old $compose_service images; continuing." >&2
 fi
 
-rm -f "$compose_backup" "$deployment_env_backup" "$runtime_env_backup"
+rm -f "$deployment_env_backup" "$runtime_env_backup"
