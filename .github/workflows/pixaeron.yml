@@ -589,6 +589,7 @@ jobs:
       - verify
       - verification-gate
     if: >-
+      !cancelled() &&
       needs.verify.result == 'success' &&
       needs.verification-gate.result == 'success' &&
       needs.verify.outputs.has_deployments == 'true' &&
@@ -637,6 +638,7 @@ jobs:
       - verification-gate
       - build-images
     if: >-
+      !cancelled() &&
       needs.verify.result == 'success' &&
       needs.verification-gate.result == 'success' &&
       needs.build-images.result == 'success' &&
