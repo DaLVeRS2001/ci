@@ -11,15 +11,28 @@ application source, runtime secrets, Compose models, or deployment manifests.
   pixaeron.yml           reusable Pixaeron backend verify/deploy workflow
   pixaeron-frontend.yml  reusable Pixaeron frontend verification workflow
   validate.yml           validation for this central repository
+  gitleaks.yml           secret scan over this repository's full history
 
 actions/pixaeron/deploy-service/
   action.yml         exposes the versioned script path to a workflow job
-  deploy-service.sh  remote Compose deployment and rollback implementation
+  deploy-service.sh  remote per-service deployment and rollback implementation
+
+actions/pixaeron/scripts/
+  action.yml               exposes the versioned pipeline script directory
+  validate-manifest.sh     deployment manifest validation
+  validate-compose.sh      rendered Compose validation
+  build-deploy-matrix.sh   deployment/GraphOS matrices and the selection summary
+  prepare-runtime-envs.sh  Parameter Store reads, masking, staged runtime envs
+  deploy-ordered.sh        one Compose install per release, then the service loop
 ```
 
 There is intentionally no anticipated `actions/shared` abstraction. Shared
 actions should be added only after another project has real duplicate
 mechanics.
+
+This repository carries `.gitattributes` with `* text=auto eol=lf` plus explicit
+shell and workflow entries, so a Windows workstation cannot commit CRLF into a
+script that runs on a Linux runner.
 
 ## Pixaeron Ownership Boundary
 
@@ -37,14 +50,21 @@ This repository owns:
 
 ```text
 .github/workflows/pixaeron.yml
+.github/workflows/gitleaks.yml
 actions/pixaeron/deploy-service/action.yml
 actions/pixaeron/deploy-service/deploy-service.sh
+actions/pixaeron/scripts/action.yml
+actions/pixaeron/scripts/*.sh
 ```
 
 The reusable workflow runs in the caller repository context. Its
 `actions/checkout` steps therefore check out Pixaeron, not this repository.
-The composite action is referenced separately by a full commit SHA so GitHub
-downloads the action and its co-located shell script from this repository.
+A reusable workflow does not check out its own repository, so nothing under
+`actions/` is reachable from `pixaeron.yml` by path. Both composite actions are
+referenced separately by a full commit SHA, which is what makes GitHub download
+the action and its co-located shell scripts from this repository. This is the
+reason the extracted pipeline scripts live behind an action rather than in a
+plain directory.
 
 ## Caller Contract
 
@@ -126,7 +146,7 @@ The `verify` job:
 9. runs a synchronous GraphOS check for every affected subgraph in a separate secret-bearing matrix job on trusted runs;
 10. reports one stable `Backend verification gate` for branch protection and deployment dependencies.
 
-Production rollout is split into two explicit jobs and runs only after
+Production rollout is split into three explicit jobs and runs only after
 successful verification, outside pull requests, for `refs/heads/main`:
 
 1. `build-images` builds every selected service in a matrix and pushes only the
@@ -143,6 +163,41 @@ successful verification, outside pull requests, for `refs/heads/main`:
    services sequentially. After every remote health check succeeds, the same
    job publishes each affected subgraph SDL from the deployed commit with
    GraphOS checks enabled.
+3. `release-outcome` closes the loop on manual runs. `build-deploy-matrix.sh`
+   writes the deployment selection to the step summary, `deploy-release`
+   exposes a `released` output, and this job turns a `workflow_dispatch`
+   release on `main` that deployed nothing into a RED run instead of a
+   misleading green one. On any other ref it explains that the dispatch was
+   verification-only. It is scoped to `workflow_dispatch`, so pull requests and
+   pushes to `main` are untouched.
+
+An explicit release dispatch that changes nothing is a contradiction, not a
+success. The guard exists because a green run is the only signal an operator
+reads before assuming production carries the new commit.
+
+### Skipped Jobs Propagate, And The Gate Does Not Stop Them
+
+Every job downstream of `graphos-check` must begin its `if` with
+`!cancelled() &&`. This is not defensive noise; it repairs a real production
+defect that the `release-outcome` guard caught on its first run.
+
+`notifications` is not a GraphOS subgraph. A release that selects only
+Notifications therefore leaves `selected_subgraphs` empty,
+`graphos_check_required` false and `graphos-check` SKIPPED. When a job declares
+an `if` without a status check function, GitHub inserts an implicit `success()`,
+and a skipped ancestor makes that expression false. The skip then travels
+transitively down the chain: `build-images` and `deploy-release` were skipped
+too, and the run finished GREEN having deployed nothing. `verification-gate` did
+not stop it, because its own `always()` rescues only itself and says nothing
+about the jobs that depend on it. This is actions/runner#2205, open since 2022.
+
+Two earlier diagnoses were wrong and are recorded here so they are not retried.
+It was not an empty deployment matrix: `service=notifications` selects exactly
+one row. It was not specific to `workflow_dispatch` either: a push to `main`
+touching only non-subgraph services skipped its release the same way and stayed
+green.
+
+### Ordered Release And Rollback
 
 The application-owned deployment manifest provides a unique integer
 `deploymentOrder`. The workflow sorts by that field before deployment. The
@@ -171,14 +226,30 @@ releases of unrelated non-subgraph services may remain service-specific.
 Before the first release step, CI uploads every validated runtime env. A missing
 live env is bootstrapped from that staged copy so Compose can resolve the whole
 project; an existing live env is not replaced until its service is selected for
-deployment. For every selected release step, the remote script backs up live
-deployment files, validates Compose, pulls the immutable image and dependencies,
-runs an optional backward-compatible migration, and waits for health. On
-failure it reports the failed phase before rollback and restores the prior
-service image/configuration. If no prior image exists, rollback removes the failed
-new service container. An `always()` final step attempts to remove staged
-runtime env copies after successful, failed, or cancelled releases; cleanup
-failures are warnings. Old labeled service images are pruned only after success.
+deployment.
+
+The Compose file is a whole-stack artifact, not a per-service one, so it is
+installed ONCE per release before the service loop. `deploy-ordered.sh` copies
+it to the VPS, keeps exactly one `docker-compose.production.yaml.release-rollback`
+baseline, and only then iterates the ordered services. A `failure()` step at
+release level restores that baseline; a `success()` step discards it. Restoring
+the stack file per service was the earlier defect: a mid-release failure could
+restore a baseline that no longer matched the services already deployed.
+Because the baseline is now release-scoped, a failed release leaves the
+pre-release Compose file on disk, and rerunning the same commit behaves like a
+first run rather than resuming from a half-installed model.
+
+`deploy-service.sh` therefore no longer touches the Compose file at all. For
+every selected release step it backs up only the live env files, validates the
+Compose service definition, pulls the immutable image and dependencies, runs an
+optional backward-compatible migration, and waits for health. On failure it
+reports the failed phase before rollback and restores the prior service
+image/configuration, restarting the service with `--no-deps` so a rollback
+cannot re-resolve dependencies against a stack that is mid-release. If no prior
+image exists, rollback removes the failed new service container. An `always()`
+final step attempts to remove staged runtime env copies after successful,
+failed, or cancelled releases; cleanup failures are warnings. Old labeled
+service images are pruned only after success.
 
 Rollback is deliberately per service, not a distributed transaction. If
 Notifications and Auth are healthy and a later Gateway deployment fails, those
@@ -186,6 +257,37 @@ services remain on the new version. Every cross-service change must therefore us
 a backward-compatible provider first, deploy its consumers afterward, and
 remove the old contract only in a later release. This keeps rollback readable
 without a custom cross-service rollback framework.
+
+## Pipeline Scripts
+
+Five run blocks moved out of `pixaeron.yml` into `actions/pixaeron/scripts/`,
+taking the workflow from 1046 to 631 lines: `validate-manifest.sh`,
+`validate-compose.sh`, `build-deploy-matrix.sh`, `prepare-runtime-envs.sh`, and
+`deploy-ordered.sh`, roughly 440 lines of bash in total. Blocks of 23 lines or
+fewer deliberately stayed inline, because extracting one of those trades a
+single YAML line for three lines of script plumbing.
+
+Two consequences of the move are easy to get wrong.
+
+Linting had to be replaced, not inherited. actionlint runs shellcheck only over
+`run:` blocks, so moving that bash into files would have silently removed
+static analysis from every extracted line. `validate.yml` therefore runs
+shellcheck directly over every `*.sh` under `actions/`. Before this change even
+`deploy-service.sh` was only checked with `bash -n`, which catches syntax
+errors and nothing else.
+
+Editing any script now needs a two-step repin, because the action pin and the
+workflow pin are independent immutable dependencies and both must be rolled
+forward. The ordered procedure is under `Release Activation` below and is not
+repeated here; what matters at this point is what each half-done attempt leaves
+behind.
+
+Commit the script and stop, and the workflow still resolves the previously
+pinned copy of the action, so the change appears to have had no effect. Repin
+the action inside `pixaeron.yml` and stop, and this repository is correct while
+the backend caller still runs the older workflow. Neither failure is visible in
+a green run, because both pins still resolve to valid, older code; only reading
+the pinned SHAs reveals which code actually ran.
 
 ## Pixaeron Frontend Workflow
 
@@ -247,6 +349,12 @@ because their container user cannot write the GitHub-mounted default configurati
 directory. A stable `Backend verification gate` aggregates local Nx verification
 and the optional matrix so branch protection never depends on dynamic job names.
 After its first successful caller run, add that exact gate to the caller repository's `main` ruleset; do not require individual matrix children.
+
+The gate runs under `always()`, which guarantees that the gate itself reports a
+result when `graphos-check` is skipped. It guarantees nothing about the jobs
+that list the gate in `needs`: `always()` rescues only the job it is written on.
+Every downstream job must carry its own status check function, which is why
+`build-images` and `deploy-release` start with `!cancelled() &&`.
 
 After the complete ordered production release passes all remote health checks,
 the same serialized release job publishes each affected subgraph's SDL from the
@@ -377,21 +485,48 @@ Cloudflare deployment remains different: the frontend repository's local deploy
 job declares `environment: production` and reads that repository's Cloudflare
 environment secret directly.
 
-## Release Activation Status
+## Public Repositories And Log Exposure
 
-The runtime-env preflight and phase-aware rollback diagnostic in the current
-working tree do not affect an existing release until both immutable central CI
-pins are rolled forward.
+All three Pixaeron repositories are public and always have been. The
+consequence that matters here is that their Actions logs are public too: anyone
+can read every line a workflow prints, in this repository and in both consumers.
 
-Activate this change in this order:
+`prepare-runtime-envs.sh` therefore emits `::add-mask::` for every SecureString
+value it reads from Parameter Store, before that value can reach any later step.
+The CI-generated `JWT_PRIVATE_KEY_BASE64` was already masked. Masking is a last
+line of defence, not a licence to print secrets: a value that is never echoed
+cannot be unmasked by a formatting accident either.
 
-1. validate, commit, and publish the `deploy-service` diagnostic change;
-2. replace the deploy action SHA inside `pixaeron.yml` with that action commit,
-   validate the runtime-env preflight, then commit and publish the workflow;
+Deploy logs published before that change expose the Lightsail database hostname.
+That is not a credential on its own, the instance is not publicly reachable, and
+the database password has since been rotated.
+
+Gitleaks over the full history of all three repositories found two hits, both
+the same dead value: a placeholder-shaped `JWT_SECRET` in the backend
+`.env.example` at two 2026-07-07 commits, from before any production
+infrastructure existed. It was never live, the Auth schema no longer accepts
+`JWT_SECRET` at all, and the stale Parameter Store entry has been deleted. Both
+hits are suppressed by fingerprint in the backend `.gitleaksignore`. The
+frontend and this repository are clean.
+
+Suppress by fingerprint, never by path or rule: a path-wide exclusion would also
+hide the next real leak in that file.
+
+## Release Activation
+
+A change to anything under `actions/` does not affect an existing release until
+both immutable pins are rolled forward. This is the standing rule for every such
+change, not a status note about one of them.
+
+Activate any action change in this order:
+
+1. validate, commit, and publish the action change itself;
+2. replace that action's SHA inside `pixaeron.yml`, validate, then commit and
+   publish the workflow;
 3. replace the backend caller's reusable-workflow SHA with the final workflow
    commit and verify a complete Pixaeron release.
 
-The deploy action and reusable workflow are separate dependencies. Until step 2,
+The actions and the reusable workflow are separate dependencies. Until step 2,
 the workflow still resolves the previously pinned action. Until step 3, the
 backend consumer cannot use either central change. A central CI merge by itself
 never updates a consumer.
@@ -415,29 +550,35 @@ changes for another product do not affect an already pinned Pixaeron workflow.
 6. Update the Pixaeron caller `uses` reference in a dedicated pull request.
 7. Merge the dependency bump only after Pixaeron verification succeeds.
 
-### Deployment-action update
+### Action update
 
-The action and reusable workflow use separate immutable pins:
-
-1. update `action.yml` and/or `deploy-service.sh`;
-2. validate and commit that action change;
-3. copy the full action commit SHA;
-4. update the action `uses` reference inside `pixaeron.yml`;
-5. validate and commit the workflow change;
-6. copy the resulting workflow commit SHA;
-7. update the Pixaeron caller in a dedicated pull request.
+This applies to both `actions/pixaeron/deploy-service` and
+`actions/pixaeron/scripts`. The actions and the reusable workflow use separate
+immutable pins, so follow the three ordered steps under `Release Activation`
+above, taking the action's commit SHA at step 1 and the resulting workflow
+commit SHA at step 2, and land the caller bump in its own pull request.
 
 This two-stage sequence prevents a mutable branch from silently replacing the
-script used by an already-reviewed Pixaeron workflow.
+scripts used by an already-reviewed Pixaeron workflow. A one-line fix to a
+pipeline script is therefore never a one-commit change.
 
 ## Validation
 
 `Validate CI repository` runs on pull requests and pushes to `main`. It:
 
 - lints workflow files with pinned actionlint 1.7.12;
-- runs `bash -n` against the Pixaeron deployment script;
-- invokes the composite action locally;
-- verifies that the action returns an existing script path.
+- runs `bash -n` against every `*.sh` under `actions/`;
+- runs shellcheck directly over every `*.sh` under `actions/`;
+- invokes both composite actions locally;
+- verifies that they return an existing deployment script path and a scripts
+  directory containing all five pipeline scripts.
+
+The direct shellcheck step is not redundant with actionlint. actionlint only
+reaches shell that is written inline in a `run:` block, so a script file is
+invisible to it.
+
+`Secret scan` runs separately, on every push and pull request, executing
+gitleaks pinned by image digest over the full history. This repository is clean.
 
 Application-specific behavior is verified by the Pixaeron caller because only
 the application repository contains its Nx workspace, Compose file, manifest,
@@ -456,7 +597,7 @@ Do not change the Pixaeron workflow or action merely to make another project's
 deployment fit. Extract a shared action only after both implementations have
 demonstrably identical mechanics.
 
-## Official references
+## Official References
 
 - [Rover authentication](https://www.apollographql.com/docs/rover/configuring)
 - [Rover subgraph commands](https://www.apollographql.com/docs/rover/commands/subgraphs)
@@ -464,6 +605,8 @@ demonstrably identical mechanics.
 - [Publishing schemas to GraphOS](https://www.apollographql.com/docs/graphos/platform/schema-management/delivery/publishing)
 - [GraphOS deployment best practices](https://www.apollographql.com/docs/graphos/platform/production-readiness/deployment-best-practices)
 - [GitHub Actions concurrency queues](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency)
+- [Job status check functions](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions)
+- [Skipped dependent jobs, actions/runner#2205](https://github.com/actions/runner/issues/2205)
 - [GraphOS graph API keys](https://www.apollographql.com/docs/graphos/platform/access-management/api-keys/graph-api-keys)
 - [GraphOS subgraph API keys](https://www.apollographql.com/docs/graphos/platform/access-management/api-keys/subgraph-api-keys)
 - [Reusable workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows)
