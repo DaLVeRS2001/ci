@@ -167,7 +167,7 @@ jobs:
           npx nx affected -t lint test build
           npx nx affected -t schema-check
           npx nx affected -t db-integration --exclude=notifications
-          DATABASE_URL="$NOTIFICATIONS_DATABASE_URL" npx nx affected -t db-integration --projects=notifications
+          DATABASE_URL="$NOTIFICATIONS_DATABASE_URL" npx nx affected -t db-integration --exclude='*,!notifications'
           npx nx affected -t redis-integration
 
       - name: Run affected end-to-end tests
