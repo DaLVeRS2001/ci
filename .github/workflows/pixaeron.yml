@@ -59,6 +59,7 @@ jobs:
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/auth
       NOTIFICATIONS_DATABASE_URL: postgresql://notifications:notifications@127.0.0.1:5432/notifications
+      CONVERSION_DATABASE_URL: postgresql://conversion:conversion@127.0.0.1:5432/conversion
       PORT: 3000
       JWT_ISSUER: http://localhost:3000/auth
       JWT_AUDIENCE: pixaeron-api
@@ -148,7 +149,7 @@ jobs:
         shell: bash
         run: echo '::notice title=Protobuf compatibility::The checked-out main commit is the compatibility baseline, so comparing it with itself would not provide a separate verification.'
 
-      - name: Create Notifications CI database
+      - name: Create service CI databases
         env:
           POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
         shell: bash
@@ -160,14 +161,20 @@ jobs:
               --command "CREATE ROLE notifications LOGIN PASSWORD 'notifications';"
           docker exec "$POSTGRES_CONTAINER_ID" \
             createdb --username postgres --owner notifications notifications
+          docker exec "$POSTGRES_CONTAINER_ID" \
+            psql --username postgres --dbname postgres --set ON_ERROR_STOP=1 \
+              --command "CREATE ROLE conversion LOGIN PASSWORD 'conversion';"
+          docker exec "$POSTGRES_CONTAINER_ID" \
+            createdb --username postgres --owner conversion conversion
 
       - name: Verify affected projects
         if: github.event_name != 'workflow_dispatch'
         run: |
           npx nx affected -t lint test build
           npx nx affected -t schema-check
-          npx nx affected -t db-integration --exclude=notifications
+          npx nx affected -t db-integration --exclude=notifications,conversion-api
           DATABASE_URL="$NOTIFICATIONS_DATABASE_URL" npx nx affected -t db-integration --exclude='*,!notifications'
+          DATABASE_URL="$CONVERSION_DATABASE_URL" npx nx affected -t db-integration --exclude='*,!conversion-api'
           npx nx affected -t redis-integration
 
       - name: Run affected end-to-end tests
@@ -194,9 +201,12 @@ jobs:
           npx nx run-many -t lint test
           npx nx run-many -t build --projects="$projects"
           npx nx run-many -t schema-check --projects="$projects"
-          npx nx run-many -t db-integration --projects="$projects" --exclude=notifications
+          npx nx run-many -t db-integration --projects="$projects" --exclude=notifications,conversion-api
           if [[ ",$projects," == *",notifications,"* ]]; then
             DATABASE_URL="$NOTIFICATIONS_DATABASE_URL" npx nx run-many -t db-integration --projects=notifications
+          fi
+          if [[ ",$projects," == *",conversion-api,"* ]]; then
+            DATABASE_URL="$CONVERSION_DATABASE_URL" npx nx run-many -t db-integration --projects=conversion-api
           fi
           npx nx run-many -t redis-integration
           npx nx run-many -t e2e
