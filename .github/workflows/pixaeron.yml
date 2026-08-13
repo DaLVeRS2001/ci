@@ -166,7 +166,9 @@ jobs:
         run: |
           npx nx affected -t lint test build
           npx nx affected -t schema-check
-          DATABASE_URL="$NOTIFICATIONS_DATABASE_URL" npx nx affected -t db-integration
+          npx nx affected -t db-integration --exclude=notifications
+          DATABASE_URL="$NOTIFICATIONS_DATABASE_URL" npx nx affected -t db-integration --projects=notifications
+          npx nx affected -t redis-integration
 
       - name: Run affected end-to-end tests
         if: github.event_name != 'workflow_dispatch'
@@ -192,7 +194,11 @@ jobs:
           npx nx run-many -t lint test
           npx nx run-many -t build --projects="$projects"
           npx nx run-many -t schema-check --projects="$projects"
-          DATABASE_URL="$NOTIFICATIONS_DATABASE_URL" npx nx run-many -t db-integration --projects="$projects"
+          npx nx run-many -t db-integration --projects="$projects" --exclude=notifications
+          if [[ ",$projects," == *",notifications,"* ]]; then
+            DATABASE_URL="$NOTIFICATIONS_DATABASE_URL" npx nx run-many -t db-integration --projects=notifications
+          fi
+          npx nx run-many -t redis-integration
           npx nx run-many -t e2e
 
       - name: Build and smoke-test deployable Docker images
