@@ -89,7 +89,7 @@ jobs:
 
       - name: Resolve pipeline scripts
         id: pipeline_scripts
-        uses: DaLVeRS2001/ci/actions/pixaeron/scripts@e6bc798ce9e3e4740e22c7799a9922150e7da802
+        uses: DaLVeRS2001/ci/actions/pixaeron/scripts@cfeff15eb1e8621c92643063d6e271cbd231adab
 
       - name: Validate deployment manifest
         env:
@@ -410,7 +410,7 @@ jobs:
 
       - name: Resolve pipeline scripts
         id: pipeline_scripts
-        uses: DaLVeRS2001/ci/actions/pixaeron/scripts@e6bc798ce9e3e4740e22c7799a9922150e7da802
+        uses: DaLVeRS2001/ci/actions/pixaeron/scripts@cfeff15eb1e8621c92643063d6e271cbd231adab
 
       - name: Reject stale production release
         id: release_guard
