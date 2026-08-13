@@ -34,6 +34,13 @@ fi
 
 subgraph_projects="$(npx nx show projects --type app --withTarget schema-check --json)"
 subgraphs='[]'
+composed_schemas="$(
+  grep -E '^[[:space:]]*file:' apps/gateway/supergraph.yaml |
+    sed -E 's/.*file:[[:space:]]*//' |
+    while IFS= read -r relative; do
+      realpath -m --relative-to=. "apps/gateway/$relative"
+    done
+)"
 
 while IFS= read -r project; do
   [[ "$project" =~ ^[A-Za-z][A-Za-z0-9_-]{0,63}$ ]] || {
@@ -62,6 +69,11 @@ while IFS= read -r project; do
     echo "GraphQL subgraph schema must be committed: $schema" >&2
     exit 1
   }
+
+  if ! grep -qxF "$schema" <<< "$composed_schemas"; then
+    echo "GraphQL subgraph $project is not in the Gateway composition yet; excluded from the deployment matrix."
+    continue
+  fi
 
   subgraphs="$(
     jq -c \
