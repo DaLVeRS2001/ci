@@ -39,6 +39,12 @@ jobs:
       GRAPHQL_API_URL: ${{ inputs.graphql_api_url }}
       GOOGLE_CLIENT_ID: ${{ inputs.google_client_id }}
       TURNSTILE_SITE_KEY: ${{ inputs.turnstile_site_key }}
+      TRUSTED_RUN: >-
+        ${{ github.event_name != 'pull_request' ||
+        (
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.actor != 'dependabot[bot]'
+        ) }}
 
     steps:
       - name: Validate public build configuration
@@ -53,21 +59,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Install Rover
-        if: >-
-          github.event_name != 'pull_request' ||
-          (
-            github.event.pull_request.head.repo.full_name == github.repository &&
-            github.actor != 'dependabot[bot]'
-          )
+        if: env.TRUSTED_RUN == 'true'
         uses: apollographql-gh-actions/install-rover@4e7208e7343acc2796d3bb2b35e4504ea10f0cb2 # Rover 0.41.0
 
       - name: Fetch composed GraphOS API schema
-        if: >-
-          github.event_name != 'pull_request' ||
-          (
-            github.event.pull_request.head.repo.full_name == github.repository &&
-            github.actor != 'dependabot[bot]'
-          )
+        if: env.TRUSTED_RUN == 'true'
         env:
           APOLLO_GRAPH_REF: ${{ inputs.apollo_graph_ref }}
           APOLLO_KEY: ${{ secrets.APOLLO_KEY }}
@@ -79,12 +75,7 @@ jobs:
           rover --skip-update-check graph fetch "$APOLLO_GRAPH_REF" --output graphql/schema.graphql
 
       - name: Check committed GraphQL schema snapshot
-        if: >-
-          github.event_name != 'pull_request' ||
-          (
-            github.event.pull_request.head.repo.full_name == github.repository &&
-            github.actor != 'dependabot[bot]'
-          )
+        if: env.TRUSTED_RUN == 'true'
         shell: bash
         run: |
           git ls-files --error-unmatch graphql/schema.graphql > /dev/null || {
