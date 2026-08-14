@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -ne 5 ]]; then
-  echo 'Usage: deploy-service.sh <service> <image-tag-env> <image-tag> <runtime-env-file-env> <migration-command>' >&2
+if [[ $# -lt 5 || $# -gt 6 ]]; then
+  echo 'Usage: deploy-service.sh <service> <image-tag-env> <image-tag> <runtime-env-file-env> <migration-command> [compose-file]' >&2
   exit 2
 fi
 
@@ -11,10 +11,11 @@ image_tag_env="$2"
 image_tag="$3"
 runtime_env_file_env="$4"
 migration_command="$5"
+compose_file_name="${6:-docker-compose.production.yaml}"
 deployment_phase='deployment setup'
 
 deployment_dir=/opt/pixaeron
-compose_file="$deployment_dir/docker-compose.production.yaml"
+compose_file="$deployment_dir/$compose_file_name"
 deployment_env="$deployment_dir/deployment.env"
 runtime_env="$deployment_dir/${compose_service}.env"
 

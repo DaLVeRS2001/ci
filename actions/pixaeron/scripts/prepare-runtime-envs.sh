@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck source=actions/pixaeron/scripts/deployment-hosts.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/deployment-hosts.sh"
+
 runtime_dir="$RUNNER_TEMP/pixaeron-runtime"
 install -m 700 -d "$runtime_dir"
 umask 077
@@ -77,23 +80,26 @@ while IFS= read -r deployment; do
   prepare_runtime_env "$deployment"
 done < <(jq -c '.[]' .github/deploy-services.json)
 
-ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
-  'install -d -m 755 /opt/pixaeron'
+while IFS= read -r host; do
+  address="$(host_address "$host")"
+  ssh -n -o BatchMode=yes "$VPS_USER@$address" 'install -d -m 755 /opt/pixaeron'
+done < <(jq -r '[.include[].host] | unique[]' <<< "$DEPLOYMENTS")
 
 while IFS= read -r deployment; do
   project="$(jq -r '.project' <<< "$deployment")"
   compose_service="$(jq -r '.composeService' <<< "$deployment")"
+  address="$(host_address "$(jq -r '.host' <<< "$deployment")")"
   service_env="$runtime_dir/$compose_service.env"
   staged_env="/opt/pixaeron/$compose_service.env.next"
   live_env="/opt/pixaeron/$compose_service.env"
 
   scp -p -o BatchMode=yes "$service_env" \
-    "$VPS_USER@$VPS_HOST:$staged_env"
+    "$VPS_USER@$address:$staged_env"
 
   printf -v bootstrap_command \
     'if [ ! -f %q ]; then install -m 600 -- %q %q; fi' \
     "$live_env" "$staged_env" "$live_env"
-  ssh -n -o BatchMode=yes "$VPS_USER@$VPS_HOST" "$bootstrap_command"
+  ssh -n -o BatchMode=yes "$VPS_USER@$address" "$bootstrap_command"
 
   echo "Runtime configuration for $project is ready."
-done < <(jq -c '.[]' .github/deploy-services.json)
+done < <(jq -c '.include[]' <<< "$DEPLOYMENTS")

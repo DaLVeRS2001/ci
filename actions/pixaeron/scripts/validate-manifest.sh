@@ -7,6 +7,8 @@ jq -e '
   all(.[];
     (.project | type) == "string" and
     (.project | test("\\A[A-Za-z][A-Za-z0-9_-]{0,63}\\z")) and
+    (.host | type) == "string" and
+    (.host == "application" or .host == "worker") and
     (.deploymentOrder | type) == "number" and
     (.deploymentOrder | floor) == .deploymentOrder and
     (.deploymentOrder >= 0) and

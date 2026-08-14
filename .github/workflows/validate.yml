@@ -63,6 +63,7 @@ jobs:
           set -euo pipefail
 
           for script in validate-manifest validate-compose build-deploy-matrix \
-            prepare-runtime-envs deploy-ordered; do
+            prepare-runtime-envs deploy-ordered cleanup-release-staging \
+            deployment-hosts; do
             test -f "$PIPELINE_SCRIPTS/$script.sh"
           done

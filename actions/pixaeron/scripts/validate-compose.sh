@@ -9,23 +9,39 @@ jq -r --arg runtime_env "$PWD/.ci/runtime.env" \
   '.[] | .imageTagEnv + "=validation", .runtimeEnvFileEnv + "=" + $runtime_env' \
   .github/deploy-services.json > .ci/deployment.env
 
-compose_config="$(
-  PIXAERON_CERTS_DIR="$PWD/.ci/certs" \
-  docker compose --env-file .ci/deployment.env \
-    -f docker-compose.production.yaml \
-    config --format json
-)"
+# shellcheck source=actions/pixaeron/scripts/deployment-hosts.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/deployment-hosts.sh"
 
-while IFS=$'\t' read -r service expected_image; do
-  actual_image="$(jq -r --arg service "$service" '.services[$service].image // ""' <<< "$compose_config")"
-  [[ "$actual_image" == "$expected_image" ]] || {
-    echo "Compose service $service must use image $expected_image; found ${actual_image:-<missing>}." >&2
-    exit 1
-  }
-done < <(jq -r '.[] | [.composeService, (.imageName + ":validation")] | @tsv' .github/deploy-services.json)
+host_compose_config() {
+  local compose_file
+  compose_file="$(host_compose_file "$1")"
+
+  PIXAERON_CERTS_DIR="$PWD/.ci/certs" \
+    docker compose --env-file .ci/deployment.env \
+      -f "$compose_file" \
+      config --format json
+}
+
+while IFS= read -r host; do
+  host_config="$(host_compose_config "$host")"
+
+  while IFS=$'\t' read -r service expected_image; do
+    actual_image="$(jq -r --arg service "$service" '.services[$service].image // ""' <<< "$host_config")"
+    [[ "$actual_image" == "$expected_image" ]] || {
+      echo "Compose service $service must use image $expected_image on the $host host; found ${actual_image:-<missing>}." >&2
+      exit 1
+    }
+  done < <(
+    jq -r --arg host "$host" \
+      '.[] | select(.host == $host) | [.composeService, (.imageName + ":validation")] | @tsv' \
+      .github/deploy-services.json
+  )
+done < <(jq -r '[.[].host] | unique[]' .github/deploy-services.json)
 
 if jq -e 'any(.[]; .project == "notifications")' \
   .github/deploy-services.json > /dev/null; then
+  compose_config="$(host_compose_config application)"
+
   jq -e '
     (.networks.notifications_command.internal == true) and
     (
@@ -59,6 +75,22 @@ if jq -e 'any(.[]; .project == "notifications")' \
     all(.services.gateway.ports[]; .host_ip == "127.0.0.1")
   ' <<< "$compose_config" > /dev/null || {
     echo "Notifications gRPC must bind only to its command-network alias; Notifications must own the only egress attachment and publish no host ports." >&2
+    exit 1
+  }
+fi
+
+if jq -e 'any(.[]; .project == "conversion-worker")' \
+  .github/deploy-services.json > /dev/null; then
+  worker_config="$(host_compose_config worker)"
+
+  jq -e '
+    (.services["conversion-worker"].read_only == true) and
+    (.services["conversion-worker"].cap_drop == ["ALL"]) and
+    (.services["conversion-worker"].security_opt == ["no-new-privileges:true"]) and
+    ((.services["conversion-worker"].ports // []) | length == 0) and
+    ((.services["conversion-worker"].healthcheck.test // []) | length > 0)
+  ' <<< "$worker_config" > /dev/null || {
+    echo "The conversion worker must run read-only without capabilities, privilege escalation, published ports, or a missing health check." >&2
     exit 1
   }
 fi

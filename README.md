@@ -42,7 +42,8 @@ application code:
 ```text
 .github/workflows/ci.yml       event triggers and caller permission ceiling
 .github/deploy-services.json   deployable Nx project metadata
-docker-compose.production.yaml production runtime model
+docker-compose.production.yaml application-host runtime model
+docker-compose.worker.yaml     worker-host runtime model
 apps/*/Dockerfile              service image definitions
 ```
 
@@ -121,8 +122,9 @@ The `verify` job:
 2. checks out the complete Pixaeron history;
 3. validates `.github/deploy-services.json`, including unique deployment and
    image identifiers, safe environment-key fields, and Dockerfiles inside the repository;
-4. renders and validates `docker-compose.production.yaml`, including the exact
-   manifest image assigned to every service;
+4. renders and validates one Compose file per deployment host — the manifest's
+   `host` field routes each service to `application` or `worker` — including the
+   exact manifest image assigned to every service;
 5. installs Node.js 24 dependencies with `npm ci`;
 6. on pull requests and pushes, checks protobuf compatibility and runs affected
    lint, test, build, e2e, GraphQL schema, and database-integration targets. A
@@ -228,11 +230,12 @@ live env is bootstrapped from that staged copy so Compose can resolve the whole
 project; an existing live env is not replaced until its service is selected for
 deployment.
 
-The Compose file is a whole-stack artifact, not a per-service one, so it is
-installed ONCE per release before the service loop. `deploy-ordered.sh` copies
-it to the VPS, keeps exactly one `docker-compose.production.yaml.release-rollback`
-baseline, and only then iterates the ordered services. A `failure()` step at
-release level restores that baseline; a `success()` step discards it. Restoring
+A Compose file is a whole-host artifact, not a per-service one, so each host's
+file is installed ONCE per release before the service loop. `deploy-ordered.sh`
+copies it to every host this release touches, keeps exactly one
+`<compose-file>.release-rollback` baseline per host, iterates the ordered
+services across hosts, and discards the baselines after the last service
+succeeds. A `failure()` step at release level restores them. Restoring
 the stack file per service was the earlier defect: a mid-release failure could
 restore a baseline that no longer matched the services already deployed.
 Because the baseline is now release-scoped, a failed release leaves the
@@ -261,9 +264,10 @@ without a custom cross-service rollback framework.
 ## Pipeline Scripts
 
 Five run blocks moved out of `pixaeron.yml` into `actions/pixaeron/scripts/`,
-taking the workflow from 1046 to 631 lines: `validate-manifest.sh`,
-`validate-compose.sh`, `build-deploy-matrix.sh`, `prepare-runtime-envs.sh`, and
-`deploy-ordered.sh`, roughly 440 lines of bash in total. Blocks of 23 lines or
+taking the workflow from 1046 to 638 lines: `validate-manifest.sh`,
+`validate-compose.sh`, `build-deploy-matrix.sh`, `prepare-runtime-envs.sh`,
+`deploy-ordered.sh`, `cleanup-release-staging.sh`, and the shared
+`deployment-hosts.sh`, roughly 500 lines of bash in total. Blocks of 23 lines or
 fewer deliberately stayed inline, because extracting one of those trades a
 single YAML line for three lines of script plumbing.
 

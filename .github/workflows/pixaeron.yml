@@ -17,6 +17,8 @@ on:
         required: false
       VPS_HOST:
         required: false
+      WORKER_VPS_HOST:
+        required: false
       VPS_USER:
         required: false
       VPS_SSH_PRIVATE_KEY:
@@ -222,8 +224,9 @@ jobs:
           while IFS=$'\t' read -r project dockerfile; do
             docker build --file "$dockerfile" --tag "pixaeron-ci:$project" .
 
-            if [[ "$project" == "notifications" ]]; then
-              bash apps/notifications/scripts/docker-smoke.sh "pixaeron-ci:$project"
+            smoke_script="apps/$project/scripts/docker-smoke.sh"
+            if [[ -f "$smoke_script" ]]; then
+              bash "$smoke_script" "pixaeron-ci:$project"
             fi
           done < <(
             jq -r --argjson affected "$affected" '
@@ -400,6 +403,7 @@ jobs:
       DEPLOYMENTS: ${{ needs.verify.outputs.deploy_matrix }}
       IMAGE_TAG: sha-${{ github.sha }}
       VPS_HOST: ${{ secrets.VPS_HOST }}
+      WORKER_VPS_HOST: ${{ secrets.WORKER_VPS_HOST }}
       VPS_USER: ${{ secrets.VPS_USER }}
 
     steps:
@@ -442,6 +446,7 @@ jobs:
 
           required_names=(
             VPS_HOST
+            WORKER_VPS_HOST
             VPS_USER
             VPS_SSH_PRIVATE_KEY
             VPS_KNOWN_HOSTS
@@ -486,16 +491,20 @@ jobs:
         id: deployment
         uses: DaLVeRS2001/ci/actions/pixaeron/deploy-service@1b61868aef23e961a4c8d65b2d8e376ac291b374
 
-      - name: Log in to GHCR on VPS
+      - name: Log in to GHCR on deployment hosts
         if: steps.release_guard.outputs.deploy == 'true'
         env:
           GHCR_TOKEN: ${{ github.token }}
+          PIPELINE_SCRIPTS: ${{ steps.pipeline_scripts.outputs.scripts_dir }}
         shell: bash
         run: |
           set -euo pipefail
+          source "$PIPELINE_SCRIPTS/deployment-hosts.sh"
 
-          printf '%s' "$GHCR_TOKEN" | ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
-            "docker login ghcr.io -u '${{ github.actor }}' --password-stdin"
+          while IFS= read -r host; do
+            printf '%s' "$GHCR_TOKEN" | ssh -o BatchMode=yes "$VPS_USER@$(host_address "$host")" \
+              "docker login ghcr.io -u '${{ github.actor }}' --password-stdin"
+          done < <(jq -r '[.include[].host] | unique[]' <<< "$DEPLOYMENTS")
       - name: Prepare runtime environments
         if: steps.release_guard.outputs.deploy == 'true'
         env:
@@ -511,58 +520,39 @@ jobs:
         shell: bash
         run: bash "$PIPELINE_SCRIPTS/deploy-ordered.sh"
 
-      - name: Restore the pre-release Compose file
+      - name: Restore the pre-release Compose files
         if: ${{ failure() && steps.release_guard.outputs.deploy == 'true' }}
+        env:
+          PIPELINE_SCRIPTS: ${{ steps.pipeline_scripts.outputs.scripts_dir }}
         shell: bash
         run: |
           set -uo pipefail
+          source "$PIPELINE_SCRIPTS/deployment-hosts.sh"
 
-          if ! ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$VPS_USER@$VPS_HOST" '
-            cd /opt/pixaeron || exit 0
-            if [ -f docker-compose.production.yaml.release-rollback ]; then
-              mv -f docker-compose.production.yaml.release-rollback docker-compose.production.yaml
-              echo "Restored the pre-release Compose file."
-            else
-              echo "No pre-release Compose baseline to restore."
+          while IFS= read -r host; do
+            compose_file="$(host_compose_file "$host")"
+            printf -v restore_command '
+              cd /opt/pixaeron || exit 0
+              if [ -f %q.release-rollback ]; then
+                mv -f %q.release-rollback %q
+                echo "Restored the pre-release Compose file."
+              else
+                echo "No pre-release Compose baseline to restore."
+              fi
+            ' "$compose_file" "$compose_file" "$compose_file"
+
+            if ! ssh -n -o BatchMode=yes -o ConnectTimeout=10 \
+              "$VPS_USER@$(host_address "$host")" "$restore_command"; then
+              echo "::error title=Compose restore failed::The pre-release Compose file may still be replaced on the $host host. Restore /opt/pixaeron/$compose_file.release-rollback by hand."
             fi
-          '; then
-            echo "::error title=Compose restore failed::The pre-release Compose file may still be replaced on the VPS. Restore /opt/pixaeron/docker-compose.production.yaml.release-rollback by hand."
-          fi
-
-      - name: Discard the release Compose baseline
-        if: ${{ success() && steps.release_guard.outputs.deploy == 'true' }}
-        shell: bash
-        run: |
-          set -uo pipefail
-
-          if ! ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$VPS_USER@$VPS_HOST" \
-            'rm -f -- /opt/pixaeron/docker-compose.production.yaml.release-rollback'; then
-            echo "::warning title=Baseline cleanup failed::Could not remove the release Compose baseline."
-          fi
+          done < <(jq -r '[.include[].host] | unique[]' <<< "$DEPLOYMENTS")
 
       - name: Clean up staged runtime environments
         if: ${{ always() && steps.release_guard.outputs.deploy == 'true' }}
+        env:
+          PIPELINE_SCRIPTS: ${{ steps.pipeline_scripts.outputs.scripts_dir }}
         shell: bash
-        run: |
-          set -uo pipefail
-
-          if [[ ! -f ~/.ssh/id_ed25519 ]]; then
-            echo 'SSH was not configured; no remote staging cleanup is needed.'
-            exit 0
-          fi
-
-          while IFS= read -r compose_service; do
-            staged_env="/opt/pixaeron/$compose_service.env.next"
-            printf -v cleanup_command 'rm -f -- %q' "$staged_env"
-            if ! ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$VPS_USER@$VPS_HOST" "$cleanup_command"; then
-              echo "::warning title=Staging cleanup failed::Could not remove the staged $compose_service runtime environment."
-            fi
-          done < <(jq -r '.[].composeService' .github/deploy-services.json)
-
-          if ! ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$VPS_USER@$VPS_HOST" \
-            'rm -f -- /opt/pixaeron/docker-compose.production.yaml.next'; then
-            echo '::warning title=Staging cleanup failed::Could not remove the staged Compose file.'
-          fi
+        run: bash "$PIPELINE_SCRIPTS/cleanup-release-staging.sh"
 
       - name: Publish deployed subgraph schemas
         if: >-
