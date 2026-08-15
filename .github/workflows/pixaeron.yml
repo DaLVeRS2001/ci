@@ -91,7 +91,7 @@ jobs:
 
       - name: Resolve pipeline scripts
         id: pipeline_scripts
-        uses: DaLVeRS2001/ci/actions/pixaeron/scripts@cfeff15eb1e8621c92643063d6e271cbd231adab
+        uses: DaLVeRS2001/ci/actions/pixaeron/scripts@519906579068e748058a2cc31c0e148f6eef5acb
 
       - name: Validate deployment manifest
         env:
@@ -414,7 +414,7 @@ jobs:
 
       - name: Resolve pipeline scripts
         id: pipeline_scripts
-        uses: DaLVeRS2001/ci/actions/pixaeron/scripts@cfeff15eb1e8621c92643063d6e271cbd231adab
+        uses: DaLVeRS2001/ci/actions/pixaeron/scripts@519906579068e748058a2cc31c0e148f6eef5acb
 
       - name: Reject stale production release
         id: release_guard
@@ -489,7 +489,7 @@ jobs:
       - name: Resolve versioned deployment script
         if: steps.release_guard.outputs.deploy == 'true'
         id: deployment
-        uses: DaLVeRS2001/ci/actions/pixaeron/deploy-service@1b61868aef23e961a4c8d65b2d8e376ac291b374
+        uses: DaLVeRS2001/ci/actions/pixaeron/deploy-service@519906579068e748058a2cc31c0e148f6eef5acb
 
       - name: Log in to GHCR on deployment hosts
         if: steps.release_guard.outputs.deploy == 'true'
