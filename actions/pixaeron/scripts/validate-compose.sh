@@ -79,6 +79,31 @@ if jq -e 'any(.[]; .project == "notifications")' \
   }
 fi
 
+if jq -e 'any(.[]; .project == "conversion-api")' \
+  .github/deploy-services.json > /dev/null; then
+  conversion_config="$(host_compose_config application)"
+
+  jq -e '
+    (.networks.entitlements_command.internal == true) and
+    (
+      [
+        .services
+        | to_entries[]
+        | select((.value.networks // {}) | has("entitlements_command"))
+        | .key
+      ]
+      | sort
+    ) == ["auth", "conversion-api"] and
+    (.services.auth.networks.entitlements_command.aliases == ["auth-entitlements"]) and
+    (.services.auth.environment.ENTITLEMENTS_GRPC_HOST == "auth-entitlements") and
+    (.services["conversion-api"].environment.ENTITLEMENTS_GRPC_URL == "auth-entitlements:50053") and
+    ((.services["conversion-api"].ports // []) | length == 0)
+  ' <<< "$conversion_config" > /dev/null || {
+    echo "Conversion API must reach Auth only over the internal entitlements_command network by its alias, and must publish no host port." >&2
+    exit 1
+  }
+fi
+
 if jq -e 'any(.[]; .project == "conversion-worker")' \
   .github/deploy-services.json > /dev/null; then
   worker_config="$(host_compose_config worker)"
