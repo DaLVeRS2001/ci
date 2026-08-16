@@ -75,6 +75,11 @@ while IFS= read -r project; do
     continue
   fi
 
+  grep -qE "^[[:space:]]+${project}:[[:space:]]*$" apps/gateway/supergraph.yaml || {
+    echo "GraphQL subgraph $project is composed under a different key in apps/gateway/supergraph.yaml. The composed name reaches the router, which keys header propagation and error exposure by it, while GraphOS is published under the project name." >&2
+    exit 1
+  }
+
   subgraphs="$(
     jq -c \
       --arg project "$project" \
@@ -128,10 +133,17 @@ if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$SERVICE_INPUT" != "all" ]
   fi
 fi
 
-if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]] &&
-  jq -e 'length > 1' <<< "$selected_subgraphs" > /dev/null; then
-  echo 'Multi-subgraph releases require one batch GraphOS publishSubgraphs operation.' >&2
-  exit 1
+if [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+  changed_subgraphs=0
+  while IFS= read -r schema; do
+    git diff --quiet "$NX_BASE" "$NX_HEAD" -- "$schema" ||
+      changed_subgraphs=$((changed_subgraphs + 1))
+  done < <(jq -r '.[].schema' <<< "$selected_subgraphs")
+
+  (( changed_subgraphs < 2 )) || {
+    echo 'Releases changing more than one subgraph schema require one batch GraphOS publishSubgraphs operation.' >&2
+    exit 1
+  }
 fi
 
 if [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]] &&
